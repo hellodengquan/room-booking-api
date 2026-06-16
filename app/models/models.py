@@ -11,6 +11,7 @@ from sqlalchemy import (
     Enum,
     JSON,
     UniqueConstraint,
+    Float,
 )
 from sqlalchemy.orm import relationship, declarative_base
 
@@ -39,12 +40,27 @@ class BookingStatus(PyEnum):
     CONFIRMED = "confirmed"
     CANCELLED = "cancelled"
     PENDING = "pending"
+    SKIPPED = "skipped"
 
 
 class PermissionLevel(PyEnum):
     VIEW = "view"
     BOOK = "book"
     ADMIN = "admin"
+
+
+class CancellationRequestStatus(PyEnum):
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    ROLLBACK = "rollback"
+
+
+class SuggestionScoreLevel(PyEnum):
+    EXCELLENT = "excellent"
+    GOOD = "good"
+    FAIR = "fair"
+    POOR = "poor"
 
 
 class User(Base):
@@ -59,11 +75,27 @@ class User(Base):
     permission_level = Column(
         Enum(PermissionLevel), default=PermissionLevel.BOOK, nullable=False
     )
+    timezone = Column(String(50), default="Asia/Shanghai")
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     bookings = relationship("Booking", back_populates="user")
     room_permissions = relationship("RoomPermission", back_populates="user")
+    delegations_from = relationship(
+        "BookingDelegation",
+        foreign_keys="BookingDelegation.delegator_id",
+        back_populates="delegator",
+    )
+    delegations_to = relationship(
+        "BookingDelegation",
+        foreign_keys="BookingDelegation.delegate_id",
+        back_populates="delegate",
+    )
+    cancellation_requests = relationship(
+        "CancellationRequest",
+        foreign_keys="CancellationRequest.requester_id",
+        back_populates="requester",
+    )
 
 
 class Device(Base):
@@ -93,6 +125,7 @@ class Room(Base):
     requires_approval = Column(Boolean, default=False)
     min_booking_duration = Column(Integer, default=30)
     max_booking_duration = Column(Integer, default=480)
+    timezone = Column(String(50), default="Asia/Shanghai")
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -158,12 +191,16 @@ class Booking(Base):
     recurrence_interval = Column(Integer, default=1)
     series_id = Column(String(100), index=True)
     attendee_count = Column(Integer, default=1)
+    original_booking_id = Column(Integer, ForeignKey("bookings.id"))
+    delegation_id = Column(Integer, ForeignKey("booking_delegations.id"))
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     room = relationship("Room", back_populates="bookings")
     user = relationship("User", back_populates="bookings")
     booking_devices = relationship("BookingDevice", back_populates="booking")
+    skips = relationship("BookingSkip", back_populates="booking")
+    delegation = relationship("BookingDelegation", back_populates="bookings")
 
 
 class BookingDevice(Base):
@@ -180,3 +217,80 @@ class BookingDevice(Base):
     __table_args__ = (
         UniqueConstraint("booking_id", "device_id", name="uq_booking_device"),
     )
+
+
+class BookingSkip(Base):
+    __tablename__ = "booking_skips"
+
+    id = Column(Integer, primary_key=True, index=True)
+    booking_id = Column(Integer, ForeignKey("bookings.id"), nullable=False)
+    series_id = Column(String(100), index=True)
+    skip_date = Column(DateTime, nullable=False)
+    reason = Column(Text)
+    skipped_by = Column(Integer, ForeignKey("users.id"))
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    booking = relationship("Booking", back_populates="skips")
+
+
+class BookingDelegation(Base):
+    __tablename__ = "booking_delegations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    delegator_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    delegate_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    room_id = Column(Integer, ForeignKey("rooms.id"))
+    is_active = Column(Boolean, default=True)
+    start_date = Column(DateTime)
+    end_date = Column(DateTime)
+    reason = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    delegator = relationship(
+        "User", foreign_keys=[delegator_id], back_populates="delegations_from"
+    )
+    delegate = relationship(
+        "User", foreign_keys=[delegate_id], back_populates="delegations_to"
+    )
+    bookings = relationship("Booking", back_populates="delegation")
+
+
+class CancellationRequest(Base):
+    __tablename__ = "cancellation_requests"
+
+    id = Column(Integer, primary_key=True, index=True)
+    requester_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    approver_id = Column(Integer, ForeignKey("users.id"))
+    status = Column(
+        Enum(CancellationRequestStatus),
+        default=CancellationRequestStatus.PENDING,
+        nullable=False,
+    )
+    reason = Column(Text)
+    approval_reason = Column(Text)
+    booking_ids = Column(JSON, nullable=False)
+    cancellation_type = Column(String(50), default="ids")
+    params = Column(JSON)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    approved_at = Column(DateTime)
+    rolled_back_at = Column(DateTime)
+
+    requester = relationship(
+        "User", foreign_keys=[requester_id], back_populates="cancellation_requests"
+    )
+    audit_logs = relationship("CancellationAuditLog", back_populates="request")
+
+
+class CancellationAuditLog(Base):
+    __tablename__ = "cancellation_audit_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    request_id = Column(Integer, ForeignKey("cancellation_requests.id"), nullable=False)
+    booking_id = Column(Integer, ForeignKey("bookings.id"), nullable=False)
+    original_status = Column(Enum(BookingStatus), nullable=False)
+    new_status = Column(Enum(BookingStatus), nullable=False)
+    action_type = Column(String(50), nullable=False)
+    action_by = Column(Integer, ForeignKey("users.id"))
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    request = relationship("CancellationRequest", back_populates="audit_logs")

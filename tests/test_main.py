@@ -793,3 +793,458 @@ class TestPermission:
         )
         assert response.status_code == 201
         assert response.json()["success"] is True
+
+
+class TestBookingSkips:
+    def test_skip_single_booking(self, client, test_user_id, test_room_id, auth_headers, db_session):
+        future_start = datetime.now() + timedelta(hours=2)
+        future_end = future_start + timedelta(hours=1)
+
+        booking = Booking(
+            room_id=test_room_id,
+            user_id=test_user_id,
+            title="待跳过会议",
+            start_time=future_start,
+            end_time=future_end,
+            status=BookingStatus.CONFIRMED,
+            recurrence_type=RecurrenceType.NONE,
+        )
+        db_session.add(booking)
+        db_session.commit()
+        booking_id = booking.id
+
+        response = client.post(
+            "/api/v1/bookings/skip",
+            json={
+                "booking_id": booking_id,
+                "skip_date": future_start.isoformat(),
+                "reason": "测试跳过",
+            },
+            headers=auth_headers,
+        )
+        assert response.status_code == 200
+        assert response.json()["success"] is True
+
+        db_session.expire_all()
+        updated = db_session.query(Booking).filter(Booking.id == booking_id).first()
+        assert updated.status == BookingStatus.SKIPPED
+
+    def test_skip_booking_in_series(self, client, test_user_id, test_room_id, auth_headers, db_session):
+        from app.schemas.schemas import BookingCreate, RecurrenceConfig
+        from app.services.booking_service import create_recurring_bookings
+
+        future_start = datetime.now() + timedelta(days=1, hours=10)
+        future_end = future_start + timedelta(hours=1)
+
+        booking_data = BookingCreate(
+            title="循环会议",
+            room_id=test_room_id,
+            start_time=future_start,
+            end_time=future_end,
+            attendee_count=3,
+            recurrence=RecurrenceConfig(
+                recurrence_type=RecurrenceType.DAILY,
+                recurrence_end_date=future_start + timedelta(days=5),
+            ),
+        )
+
+        created_bookings, errors = create_recurring_bookings(db_session, booking_data, test_user_id)
+        assert len(created_bookings) > 0
+        series_id = created_bookings[0].series_id
+
+        skip_date = future_start + timedelta(days=2)
+        response = client.post(
+            "/api/v1/bookings/skip",
+            json={
+                "series_id": series_id,
+                "skip_date": skip_date.isoformat(),
+                "reason": "跳过第三次",
+            },
+            headers=auth_headers,
+        )
+        assert response.status_code == 200
+        assert response.json()["success"] is True
+
+        response = client.get(
+            f"/api/v1/bookings/skips/series/{series_id}",
+            headers=auth_headers,
+        )
+        assert response.status_code == 200
+        assert len(response.json()) >= 1
+
+
+class TestSuggestionScoring:
+    def test_alternatives_have_scores(self, client, test_room_id, test_room_b_id, auth_headers, db_session):
+        future_start = datetime.now() + timedelta(hours=2)
+        future_end = future_start + timedelta(hours=1)
+
+        existing = Booking(
+            room_id=test_room_id,
+            user_id=1,
+            title="冲突会议",
+            start_time=future_start,
+            end_time=future_end,
+            status=BookingStatus.CONFIRMED,
+        )
+        db_session.add(existing)
+        db_session.commit()
+
+        response = client.get(
+            "/api/v1/bookings/check-conflict",
+            params={
+                "room_id": test_room_id,
+                "start_time": future_start.isoformat(),
+                "end_time": future_end.isoformat(),
+                "attendee_count": 5,
+            },
+            headers=auth_headers,
+        )
+        assert response.status_code == 200
+        assert response.json()["has_conflict"] is True
+
+        alternatives = response.json()["alternatives"]
+        assert len(alternatives) > 0
+
+        first_alt = alternatives[0]
+        assert "score" in first_alt
+        assert "score_level" in first_alt
+        assert "score_reasons" in first_alt
+        assert isinstance(first_alt["score"], float)
+        assert first_alt["score"] >= 0
+        assert first_alt["score"] <= 1
+
+
+class TestCalendarTimezone:
+    def test_calendar_view_with_timezone(self, client, test_room_id, auth_headers):
+        start_date = datetime.now()
+        end_date = start_date + timedelta(days=3)
+
+        response = client.get(
+            "/api/v1/calendar/view",
+            params={
+                "start_date": start_date.isoformat(),
+                "end_date": end_date.isoformat(),
+                "room_ids": [test_room_id],
+                "timezone": "Asia/Tokyo",
+            },
+            headers=auth_headers,
+        )
+        assert response.status_code == 200
+        assert response.json()["timezone"] == "Asia/Tokyo"
+
+    def test_daily_view_with_timezone(self, client, test_room_id, auth_headers):
+        today = datetime.now()
+
+        response = client.get(
+            f"/api/v1/calendar/room/{test_room_id}/daily",
+            params={
+                "date": today.isoformat(),
+                "timezone": "America/New_York",
+            },
+            headers=auth_headers,
+        )
+        assert response.status_code == 200
+        assert response.json()["timezone"] == "America/New_York"
+
+
+class TestAvailableSlotsWithDevices:
+    def test_available_slots_with_device_filter(
+        self, client, test_room_id, test_device_id, auth_headers, db_session
+    ):
+        from app.models.models import RoomDevice
+
+        rd = RoomDevice(room_id=test_room_id, device_id=test_device_id, is_permanent=True)
+        db_session.add(rd)
+        db_session.commit()
+
+        start_date = datetime.now() + timedelta(hours=1)
+        end_date = start_date + timedelta(hours=5)
+
+        response = client.get(
+            "/api/v1/calendar/available-slots",
+            params={
+                "room_id": test_room_id,
+                "start_date": start_date.isoformat(),
+                "end_date": end_date.isoformat(),
+                "duration_minutes": 60,
+                "device_ids": [test_device_id],
+            },
+            headers=auth_headers,
+        )
+        assert response.status_code == 200
+        assert "available_slots" in response.json()
+        assert "total_count" in response.json()
+
+        slots = response.json()["available_slots"]
+        if slots:
+            assert slots[0]["has_all_devices"] is True
+            assert test_device_id in slots[0]["available_device_ids"]
+
+    def test_available_slots_with_min_capacity(
+        self, client, test_room_id, test_room_b_id, auth_headers
+    ):
+        start_date = datetime.now() + timedelta(hours=1)
+        end_date = start_date + timedelta(hours=5)
+
+        response = client.get(
+            "/api/v1/calendar/available-slots",
+            params={
+                "room_ids": [test_room_id, test_room_b_id],
+                "start_date": start_date.isoformat(),
+                "end_date": end_date.isoformat(),
+                "duration_minutes": 60,
+                "min_capacity": 5,
+            },
+            headers=auth_headers,
+        )
+        assert response.status_code == 200
+
+
+class TestCancellationApproval:
+    def test_create_cancellation_request(self, client, test_user_id, test_room_id, auth_headers, db_session):
+        future_start = datetime.now() + timedelta(hours=2)
+        future_end = future_start + timedelta(hours=1)
+
+        booking = Booking(
+            room_id=test_room_id,
+            user_id=test_user_id,
+            title="待审批取消会议",
+            start_time=future_start,
+            end_time=future_end,
+            status=BookingStatus.CONFIRMED,
+        )
+        db_session.add(booking)
+        db_session.commit()
+        booking_id = booking.id
+
+        response = client.post(
+            "/api/v1/cancellations",
+            json={
+                "booking_ids": [booking_id],
+                "reason": "需要取消",
+                "cancellation_type": "ids",
+            },
+            headers=auth_headers,
+        )
+        assert response.status_code == 201
+        assert response.json()["status"] == "pending"
+
+    def test_get_my_cancellation_requests(self, client, auth_headers):
+        response = client.get(
+            "/api/v1/cancellations/my",
+            headers=auth_headers,
+        )
+        assert response.status_code == 200
+        assert isinstance(response.json(), list)
+
+    def test_approve_cancellation_request(
+        self, client, test_user_id, test_room_id, admin_headers, db_session
+    ):
+        future_start = datetime.now() + timedelta(hours=2)
+        future_end = future_start + timedelta(hours=1)
+
+        booking = Booking(
+            room_id=test_room_id,
+            user_id=test_user_id,
+            title="待批准取消的会议",
+            start_time=future_start,
+            end_time=future_end,
+            status=BookingStatus.CONFIRMED,
+        )
+        db_session.add(booking)
+        db_session.commit()
+        booking_id = booking.id
+
+        from app.models.models import CancellationRequest, CancellationRequestStatus
+
+        request = CancellationRequest(
+            requester_id=test_user_id,
+            booking_ids=[booking_id],
+            status=CancellationRequestStatus.PENDING,
+            cancellation_type="ids",
+        )
+        db_session.add(request)
+        db_session.commit()
+        request_id = request.id
+
+        response = client.post(
+            f"/api/v1/cancellations/{request_id}/approve",
+            params={"approval_reason": "批准取消"},
+            headers=admin_headers,
+        )
+        assert response.status_code == 200
+        assert response.json()["success"] is True
+
+        db_session.expire_all()
+        updated = db_session.query(Booking).filter(Booking.id == booking_id).first()
+        assert updated.status == BookingStatus.CANCELLED
+
+
+class TestCancellationRollback:
+    def test_rollback_cancellation(
+        self, client, test_user_id, test_room_id, admin_headers, db_session
+    ):
+        from app.models.models import (
+            CancellationRequest,
+            CancellationRequestStatus,
+            CancellationAuditLog,
+        )
+
+        future_start = datetime.now() + timedelta(hours=2)
+        future_end = future_start + timedelta(hours=1)
+
+        booking = Booking(
+            room_id=test_room_id,
+            user_id=test_user_id,
+            title="待回滚取消的会议",
+            start_time=future_start,
+            end_time=future_end,
+            status=BookingStatus.CANCELLED,
+        )
+        db_session.add(booking)
+        db_session.flush()
+        booking_id = booking.id
+
+        request = CancellationRequest(
+            requester_id=test_user_id,
+            booking_ids=[booking_id],
+            status=CancellationRequestStatus.APPROVED,
+            cancellation_type="ids",
+        )
+        db_session.add(request)
+        db_session.flush()
+        request_id = request.id
+
+        audit_log = CancellationAuditLog(
+            request_id=request_id,
+            booking_id=booking_id,
+            original_status=BookingStatus.CONFIRMED,
+            new_status=BookingStatus.CANCELLED,
+            action_type="cancellation",
+        )
+        db_session.add(audit_log)
+        db_session.commit()
+
+        response = client.post(
+            "/api/v1/cancellations/rollback",
+            json={"request_id": request_id, "reason": "回滚测试"},
+            headers=admin_headers,
+        )
+        assert response.status_code == 200
+        assert response.json()["success"] is True
+        assert response.json()["restored_count"] == 1
+
+        db_session.expire_all()
+        restored = db_session.query(Booking).filter(Booking.id == booking_id).first()
+        assert restored.status == BookingStatus.CONFIRMED
+
+
+class TestDelegation:
+    def test_create_delegation(self, client, test_user_id, test_room_id, auth_headers, db_session):
+        from app.models.models import User
+
+        delegate_user = User(
+            username="delegateuser",
+            email="delegate@example.com",
+            full_name="Delegate User",
+            hashed_password=get_password_hash("delegate123"),
+            permission_level=PermissionLevel.BOOK,
+        )
+        db_session.add(delegate_user)
+        db_session.commit()
+        delegate_id = delegate_user.id
+
+        response = client.post(
+            "/api/v1/delegations",
+            json={
+                "delegate_id": delegate_id,
+                "room_id": test_room_id,
+                "reason": "出差期间代订",
+            },
+            headers=auth_headers,
+        )
+        assert response.status_code == 201
+        assert response.json()["delegator_id"] == test_user_id
+        assert response.json()["delegate_id"] == delegate_id
+
+    def test_get_my_delegations(self, client, auth_headers):
+        response = client.get(
+            "/api/v1/delegations/from-me",
+            headers=auth_headers,
+        )
+        assert response.status_code == 200
+        assert isinstance(response.json(), list)
+
+    def test_get_delegations_to_me(self, client, auth_headers):
+        response = client.get(
+            "/api/v1/delegations/to-me",
+            headers=auth_headers,
+        )
+        assert response.status_code == 200
+        assert isinstance(response.json(), list)
+
+    def test_booking_with_delegation(
+        self, client, test_user_id, test_room_id, auth_headers, db_session
+    ):
+        from app.models.models import User, BookingDelegation
+        from app.dependencies import create_access_token
+
+        delegate_user = User(
+            username="delegateuser2",
+            email="delegate2@example.com",
+            full_name="Delegate User 2",
+            hashed_password=get_password_hash("delegate123"),
+            permission_level=PermissionLevel.BOOK,
+        )
+        db_session.add(delegate_user)
+        db_session.flush()
+        delegate_id = delegate_user.id
+
+        delegation = BookingDelegation(
+            delegator_id=test_user_id,
+            delegate_id=delegate_id,
+            room_id=test_room_id,
+            is_active=True,
+        )
+        db_session.add(delegation)
+        db_session.commit()
+
+        token = create_access_token(data={"sub": delegate_user.username})
+        delegate_headers = {"Authorization": f"Bearer {token}"}
+
+        future_start = datetime.now() + timedelta(hours=2)
+        future_end = future_start + timedelta(hours=1)
+
+        response = client.post(
+            "/api/v1/bookings",
+            json={
+                "title": "代订的会议",
+                "room_id": test_room_id,
+                "start_time": future_start.isoformat(),
+                "end_time": future_end.isoformat(),
+                "attendee_count": 3,
+                "delegate_user_id": test_user_id,
+            },
+            headers=delegate_headers,
+        )
+        assert response.status_code == 201
+        assert response.json()["success"] is True
+
+        booking = response.json()["bookings"][0]
+        assert booking["user_id"] == test_user_id
+        assert booking["delegation_id"] is not None
+
+
+class TestCoverage:
+    def test_root_endpoint_features(self, client):
+        response = client.get("/")
+        assert response.status_code == 200
+        data = response.json()
+        assert "features" in data
+        assert len(data["features"]) > 5
+        assert data["version"] == "2.0.0"
+
+    def test_health_check_v2(self, client):
+        response = client.get("/health")
+        assert response.status_code == 200
+        assert response.json()["version"] == "2.0.0"

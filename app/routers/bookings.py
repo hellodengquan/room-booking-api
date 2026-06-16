@@ -14,6 +14,7 @@ from app.models.models import (
     Device,
     RecurrenceType,
     PermissionLevel,
+    BookingSkip,
 )
 from app.schemas.schemas import (
     BookingCreate,
@@ -22,12 +23,16 @@ from app.schemas.schemas import (
     BookingListResponse,
     ConflictInfo,
     AlternativeSuggestion,
+    BookingSkipCreate,
+    BookingSkipResponse,
 )
 from app.services.booking_service import (
     check_time_conflict,
     check_device_conflict,
     find_alternative_slots,
     create_recurring_bookings,
+    skip_booking,
+    check_delegation_permission,
 )
 
 router = APIRouter(prefix="/bookings", tags=["预订管理"])
@@ -90,6 +95,7 @@ async def check_conflict(
     end_time: datetime,
     device_ids: Optional[List[int]] = Query(None),
     exclude_booking_id: Optional[int] = None,
+    attendee_count: Optional[int] = Query(1, ge=1),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_active_user),
 ):
@@ -106,7 +112,9 @@ async def check_conflict(
     alternatives = []
     if time_conflicts or device_conflicts:
         alternatives = find_alternative_slots(
-            db, room_id, start_time, end_time, exclude_booking_id
+            db, room_id, start_time, end_time, exclude_booking_id,
+            required_device_ids=device_ids,
+            required_capacity=attendee_count,
         )
 
     return {
@@ -138,8 +146,23 @@ async def create_booking(
 ):
     from app.services.booking_service import check_user_permission
 
+    booking_user_id = current_user.id
+    delegation_id = None
+
+    if booking_in.delegate_user_id and booking_in.delegate_user_id != current_user.id:
+        delegation = check_delegation_permission(
+            db, booking_in.delegate_user_id, current_user.id, booking_in.room_id
+        )
+        if not delegation:
+            raise HTTPException(
+                status_code=403,
+                detail="您没有权限代此用户预订",
+            )
+        booking_user_id = booking_in.delegate_user_id
+        delegation_id = delegation.id
+
     if not check_user_permission(
-        db, current_user.id, booking_in.room_id, PermissionLevel.BOOK
+        db, booking_user_id, booking_in.room_id, PermissionLevel.BOOK
     ):
         raise HTTPException(
             status_code=403,
@@ -186,6 +209,8 @@ async def create_booking(
             booking_in.room_id,
             booking_in.start_time,
             booking_in.end_time,
+            required_device_ids=booking_in.device_ids,
+            required_capacity=booking_in.attendee_count,
         )
         return {
             "success": False,
@@ -195,7 +220,7 @@ async def create_booking(
         }
 
     created_bookings, errors = create_recurring_bookings(
-        db, booking_in, current_user.id
+        db, booking_in, booking_user_id, delegation_id
     )
 
     if not created_bookings and errors:
@@ -204,6 +229,8 @@ async def create_booking(
             booking_in.room_id,
             booking_in.start_time,
             booking_in.end_time,
+            required_device_ids=booking_in.device_ids,
+            required_capacity=booking_in.attendee_count,
         )
         return {
             "success": False,
@@ -230,6 +257,7 @@ async def create_booking(
                 recurrence_interval=booking.recurrence_interval,
                 series_id=booking.series_id,
                 attendee_count=booking.attendee_count,
+                delegation_id=booking.delegation_id,
                 created_at=booking.created_at,
                 updated_at=booking.updated_at,
             )
@@ -240,6 +268,7 @@ async def create_booking(
         "message": f"成功创建 {len(created_bookings)} 个预订",
         "bookings": response_bookings,
         "errors": errors if errors else None,
+        "delegation_id": delegation_id,
     }
 
 
@@ -411,3 +440,72 @@ async def cancel_booking_series(
         "cancelled_count": cancelled_count,
         "total_count": len(bookings),
     }
+
+
+@router.post("/skip", response_model=Dict[str, Any])
+async def skip_booking_route(
+    skip_in: BookingSkipCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    if skip_in.booking_id:
+        booking = db.query(Booking).filter(Booking.id == skip_in.booking_id).first()
+        if not booking:
+            raise HTTPException(status_code=404, detail="预订不存在")
+        if (
+            booking.user_id != current_user.id
+            and current_user.permission_level != PermissionLevel.ADMIN
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="您没有权限跳过此预订",
+            )
+    elif skip_in.series_id:
+        bookings = (
+            db.query(Booking)
+            .filter(Booking.series_id == skip_in.series_id)
+            .first()
+        )
+        if not bookings:
+            raise HTTPException(status_code=404, detail="预订系列不存在")
+        if (
+            bookings.user_id != current_user.id
+            and current_user.permission_level != PermissionLevel.ADMIN
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="您没有权限跳过此系列中的预订",
+            )
+
+    success, message = skip_booking(db, skip_in, current_user.id)
+    if not success:
+        raise HTTPException(status_code=400, detail=message)
+
+    return {"success": True, "message": message}
+
+
+@router.get("/skips/series/{series_id}", response_model=List[BookingSkipResponse])
+async def get_series_skips(
+    series_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    skips = (
+        db.query(BookingSkip)
+        .filter(BookingSkip.series_id == series_id)
+        .order_by(BookingSkip.skip_date.desc())
+        .all()
+    )
+
+    if skips:
+        sample_booking = (
+            db.query(Booking).filter(Booking.series_id == series_id).first()
+        )
+        if sample_booking and sample_booking.user_id != current_user.id:
+            if current_user.permission_level != PermissionLevel.ADMIN:
+                raise HTTPException(
+                    status_code=403,
+                    detail="您没有权限查看此系列的跳过记录",
+                )
+
+    return skips

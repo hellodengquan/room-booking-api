@@ -6,6 +6,8 @@ from app.models.models import (
     BookingStatus,
     PermissionLevel,
     Weekday,
+    CancellationRequestStatus,
+    SuggestionScoreLevel,
 )
 
 
@@ -14,10 +16,18 @@ class UserBase(BaseModel):
     email: str = Field(..., max_length=100)
     full_name: Optional[str] = Field(None, max_length=100)
     permission_level: PermissionLevel = PermissionLevel.BOOK
+    timezone: str = "Asia/Shanghai"
 
 
 class UserCreate(UserBase):
     password: str = Field(..., min_length=6, max_length=100)
+
+
+class UserUpdate(BaseModel):
+    full_name: Optional[str] = Field(None, max_length=100)
+    email: Optional[str] = Field(None, max_length=100)
+    timezone: Optional[str] = None
+    permission_level: Optional[PermissionLevel] = None
 
 
 class UserResponse(UserBase):
@@ -91,6 +101,7 @@ class RoomBase(BaseModel):
     requires_approval: bool = False
     min_booking_duration: int = Field(30, ge=15)
     max_booking_duration: int = Field(480, ge=30)
+    timezone: str = "Asia/Shanghai"
 
 
 class RoomCreate(RoomBase):
@@ -107,6 +118,7 @@ class RoomUpdate(BaseModel):
     requires_approval: Optional[bool] = None
     min_booking_duration: Optional[int] = Field(None, ge=15)
     max_booking_duration: Optional[int] = Field(None, ge=30)
+    timezone: Optional[str] = None
     devices: Optional[List[int]] = None
 
 
@@ -129,6 +141,7 @@ class RoomListResponse(BaseModel):
     capacity: int
     is_active: bool
     requires_approval: bool
+    timezone: str = "Asia/Shanghai"
 
 
 class RecurrenceConfig(BaseModel):
@@ -146,6 +159,25 @@ class RecurrenceConfig(BaseModel):
         return v
 
 
+class BookingSkipCreate(BaseModel):
+    booking_id: Optional[int] = None
+    series_id: Optional[str] = None
+    skip_date: datetime
+    reason: Optional[str] = None
+
+
+class BookingSkipResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    booking_id: int
+    series_id: Optional[str]
+    skip_date: datetime
+    reason: Optional[str]
+    skipped_by: Optional[int]
+    created_at: datetime
+
+
 class BookingDeviceCreate(BaseModel):
     device_id: int
 
@@ -159,6 +191,7 @@ class BookingBase(BaseModel):
     attendee_count: int = Field(1, ge=1)
     device_ids: Optional[List[int]] = None
     recurrence: Optional[RecurrenceConfig] = None
+    delegate_user_id: Optional[int] = None
 
     @field_validator("end_time")
     def end_after_start(cls, v, values):
@@ -197,6 +230,11 @@ class AlternativeSuggestion(BaseModel):
     start_time: datetime
     end_time: datetime
     duration_minutes: int
+    score: float = 0.0
+    score_level: SuggestionScoreLevel = SuggestionScoreLevel.FAIR
+    score_reasons: List[str] = []
+    has_required_devices: bool = True
+    capacity_match: bool = True
 
 
 class BookingResponse(BaseModel):
@@ -216,6 +254,7 @@ class BookingResponse(BaseModel):
     recurrence_interval: int
     series_id: Optional[str]
     attendee_count: int
+    delegation_id: Optional[int]
     created_at: datetime
     updated_at: datetime
     conflicts: Optional[List[ConflictInfo]] = None
@@ -242,6 +281,7 @@ class CalendarViewQuery(BaseModel):
     end_date: datetime
     room_ids: Optional[List[int]] = None
     user_id: Optional[int] = None
+    timezone: Optional[str] = None
 
 
 class CalendarBooking(BaseModel):
@@ -264,8 +304,34 @@ class CalendarDayView(BaseModel):
 class CalendarViewResponse(BaseModel):
     start_date: datetime
     end_date: datetime
+    timezone: str
     rooms: List[RoomListResponse]
     calendar: Dict[str, List[CalendarBooking]]
+
+
+class AvailableSlotQuery(BaseModel):
+    room_id: Optional[int] = None
+    room_ids: Optional[List[int]] = None
+    start_date: datetime
+    end_date: datetime
+    duration_minutes: int = Field(60, ge=15, le=480)
+    device_ids: Optional[List[int]] = None
+    min_capacity: Optional[int] = None
+
+
+class AvailableSlot(BaseModel):
+    room_id: int
+    room_name: str
+    start_time: datetime
+    end_time: datetime
+    duration_minutes: int
+    has_all_devices: bool = True
+    available_device_ids: List[int] = []
+
+
+class AvailableSlotsResponse(BaseModel):
+    available_slots: List[AvailableSlot]
+    total_count: int
 
 
 class BatchCancelRequest(BaseModel):
@@ -276,6 +342,8 @@ class BatchCancelRequest(BaseModel):
     user_id: Optional[int] = None
     room_id: Optional[int] = None
     cancel_all: bool = False
+    reason: Optional[str] = None
+    require_approval: bool = False
 
 
 class BatchCancelResponse(BaseModel):
@@ -283,6 +351,86 @@ class BatchCancelResponse(BaseModel):
     cancelled_ids: List[int]
     failed_count: int
     errors: List[Dict[str, Any]]
+    rollback_supported: bool = True
+    audit_log_id: Optional[int] = None
+
+
+class CancellationRequestCreate(BaseModel):
+    booking_ids: List[int]
+    reason: Optional[str] = None
+    cancellation_type: str = "ids"
+    params: Optional[Dict[str, Any]] = None
+
+
+class CancellationRequestResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    requester_id: int
+    approver_id: Optional[int]
+    status: CancellationRequestStatus
+    reason: Optional[str]
+    approval_reason: Optional[str]
+    booking_ids: List[int]
+    cancellation_type: str
+    params: Optional[Dict[str, Any]]
+    created_at: datetime
+    approved_at: Optional[datetime]
+    rolled_back_at: Optional[datetime]
+
+
+class CancellationAuditLogResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    request_id: int
+    booking_id: int
+    original_status: BookingStatus
+    new_status: BookingStatus
+    action_type: str
+    action_by: Optional[int]
+    created_at: datetime
+
+
+class BookingDelegationCreate(BaseModel):
+    delegate_id: int
+    room_id: Optional[int] = None
+    start_date: Optional[datetime] = None
+    end_date: Optional[datetime] = None
+    reason: Optional[str] = None
+
+
+class BookingDelegationUpdate(BaseModel):
+    is_active: Optional[bool] = None
+    start_date: Optional[datetime] = None
+    end_date: Optional[datetime] = None
+    reason: Optional[str] = None
+
+
+class BookingDelegationResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    delegator_id: int
+    delegate_id: int
+    room_id: Optional[int]
+    is_active: bool
+    start_date: Optional[datetime]
+    end_date: Optional[datetime]
+    reason: Optional[str]
+    created_at: datetime
+
+
+class RollbackRequest(BaseModel):
+    request_id: int
+    reason: Optional[str] = None
+
+
+class RollbackResponse(BaseModel):
+    success: bool
+    restored_count: int
+    restored_ids: List[int]
+    message: str
 
 
 class Token(BaseModel):
@@ -292,3 +440,14 @@ class Token(BaseModel):
 
 class TokenData(BaseModel):
     username: Optional[str] = None
+
+
+class CoverageStats(BaseModel):
+    total_tests: int
+    passed_tests: int
+    failed_tests: int
+    skipped_tests: int
+    coverage_percent: float
+    covered_lines: int
+    missing_lines: int
+    total_lines: int

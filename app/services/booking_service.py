@@ -1,4 +1,5 @@
 import uuid
+import math
 from datetime import datetime, timedelta
 from typing import List, Optional, Tuple, Dict, Any
 from sqlalchemy.orm import Session
@@ -13,12 +14,21 @@ from app.models.models import (
     RecurrenceType,
     PermissionLevel,
     RoomPermission,
+    BookingSkip,
+    BookingDelegation,
+    CancellationRequest,
+    CancellationRequestStatus,
+    CancellationAuditLog,
+    SuggestionScoreLevel,
 )
 from app.schemas.schemas import (
     BookingCreate,
     ConflictInfo,
     AlternativeSuggestion,
     RecurrenceConfig,
+    BookingSkipCreate,
+    BookingDelegationCreate,
+    BatchCancelRequest,
 )
 from app.config import settings
 
@@ -202,6 +212,94 @@ def generate_recurrence_dates(
     return dates
 
 
+def _calculate_suggestion_score(
+    room: Room,
+    desired_start: datetime,
+    actual_start: datetime,
+    desired_end: datetime,
+    actual_end: datetime,
+    original_room_id: int,
+    required_device_ids: Optional[List[int]] = None,
+    required_capacity: int = 1,
+    db: Session = None,
+) -> Tuple[float, List[str], bool, bool]:
+    score = 0.0
+    reasons = []
+
+    time_diff_minutes = abs((actual_start - desired_start).total_seconds()) / 60
+    if time_diff_minutes == 0:
+        time_score = 1.0
+        reasons.append("时间完全匹配")
+    elif time_diff_minutes <= 30:
+        time_score = 0.9 - (time_diff_minutes / 300)
+        reasons.append(f"时间偏差 {int(time_diff_minutes)} 分钟")
+    elif time_diff_minutes <= 120:
+        time_score = 0.7 - (time_diff_minutes / 400)
+        reasons.append(f"时间偏差 {int(time_diff_minutes)} 分钟")
+    else:
+        time_score = max(0.1, 0.4 - (time_diff_minutes / 1440))
+        reasons.append(f"时间偏差较大 ({int(time_diff_minutes)} 分钟)")
+
+    if room.id == original_room_id:
+        room_score = 1.0
+        reasons.append("原会议室")
+    else:
+        capacity_diff = abs(room.capacity - required_capacity)
+        if room.capacity >= required_capacity:
+            if room.capacity <= required_capacity + 5:
+                room_score = 0.8
+                reasons.append("相似容量会议室")
+            else:
+                room_score = 0.6
+                reasons.append("更大容量会议室")
+        else:
+            room_score = 0.3
+            reasons.append("容量较小会议室")
+
+    has_devices = True
+    if required_device_ids and db:
+        room_device_ids = [
+            rd.device_id
+            for rd in room.room_devices
+            if rd.is_permanent
+        ]
+        available_count = sum(1 for d in required_device_ids if d in room_device_ids)
+        if available_count == len(required_device_ids):
+            device_score = 1.0
+            reasons.append("所有设备可用")
+        elif available_count > 0:
+            device_score = 0.5 * (available_count / len(required_device_ids))
+            reasons.append(f"部分设备可用 ({available_count}/{len(required_device_ids)})")
+            has_devices = False
+        else:
+            device_score = 0.1
+            reasons.append("缺少所需设备")
+            has_devices = False
+    else:
+        device_score = 0.5
+
+    capacity_match = room.capacity >= required_capacity
+
+    final_score = (
+        time_score * settings.SUGGESTION_SCORE_WEIGHT_TIME
+        + room_score * settings.SUGGESTION_SCORE_WEIGHT_ROOM
+        + device_score * settings.SUGGESTION_SCORE_WEIGHT_DEVICE
+    )
+
+    return final_score, reasons, has_devices, capacity_match
+
+
+def _determine_score_level(score: float) -> SuggestionScoreLevel:
+    if score >= 0.85:
+        return SuggestionScoreLevel.EXCELLENT
+    elif score >= 0.7:
+        return SuggestionScoreLevel.GOOD
+    elif score >= 0.5:
+        return SuggestionScoreLevel.FAIR
+    else:
+        return SuggestionScoreLevel.POOR
+
+
 def find_alternative_slots(
     db: Session,
     room_id: int,
@@ -209,67 +307,100 @@ def find_alternative_slots(
     desired_end: datetime,
     exclude_booking_id: Optional[int] = None,
     max_suggestions: int = settings.MAX_ALTERNATIVE_SUGGESTIONS,
+    required_device_ids: Optional[List[int]] = None,
+    required_capacity: int = 1,
 ) -> List[AlternativeSuggestion]:
     suggestions = []
     duration = desired_end - desired_start
     duration_minutes = int(duration.total_seconds() / 60)
 
-    room = db.query(Room).filter(Room.id == room_id).first()
-    if not room:
+    original_room = db.query(Room).filter(Room.id == room_id).first()
+    if not original_room:
         return suggestions
-
-    existing_bookings = (
-        db.query(Booking)
-        .filter(
-            Booking.room_id == room_id,
-            Booking.status == BookingStatus.CONFIRMED,
-            Booking.start_time >= desired_start - timedelta(days=7),
-            Booking.end_time <= desired_end + timedelta(days=7),
-        )
-        .order_by(Booking.start_time)
-        .all()
-    )
-
-    if exclude_booking_id:
-        existing_bookings = [b for b in existing_bookings if b.id != exclude_booking_id]
-
-    candidate_periods = [
-        (desired_start, desired_end),
-        (desired_start + timedelta(minutes=30), desired_end + timedelta(minutes=30)),
-        (desired_start - timedelta(minutes=30), desired_end - timedelta(minutes=30)),
-        (desired_start + timedelta(hours=1), desired_end + timedelta(hours=1)),
-        (desired_start - timedelta(hours=1), desired_end - timedelta(hours=1)),
-        (desired_start + timedelta(days=1), desired_end + timedelta(days=1)),
-        (desired_start - timedelta(days=1), desired_end - timedelta(days=1)),
-    ]
 
     all_rooms = db.query(Room).filter(Room.is_active == True).all()
 
-    for room_candidate in all_rooms:
-        for start, end in candidate_periods:
+    time_offsets = [
+        timedelta(0),
+        timedelta(minutes=30),
+        timedelta(minutes=-30),
+        timedelta(hours=1),
+        timedelta(hours=-1),
+        timedelta(hours=2),
+        timedelta(hours=-2),
+        timedelta(days=1),
+        timedelta(days=-1),
+        timedelta(days=2),
+        timedelta(days=-2),
+    ]
+
+    candidate_slots = []
+    for room in all_rooms:
+        for offset in time_offsets:
+            start = desired_start + offset
+            end = desired_end + offset
             if start < datetime.now():
                 continue
+            candidate_slots.append((room, start, end))
 
-            if room_candidate.id == room_id:
-                conflicts = check_time_conflict(
-                    db, room_candidate.id, start, end, exclude_booking_id
-                )
-            else:
-                conflicts = check_time_conflict(db, room_candidate.id, start, end)
+    scored_slots = []
+    for room, start, end in candidate_slots:
+        conflicts = check_time_conflict(
+            db, room.id, start, end,
+            exclude_booking_id if room.id == room_id else None
+        )
+        if conflicts:
+            continue
 
-            if not conflicts:
-                suggestions.append(
-                    AlternativeSuggestion(
-                        room_id=room_candidate.id,
-                        room_name=room_candidate.name,
-                        start_time=start,
-                        end_time=end,
-                        duration_minutes=duration_minutes,
-                    )
-                )
+        score, reasons, has_devices, capacity_match = _calculate_suggestion_score(
+            room,
+            desired_start,
+            start,
+            desired_end,
+            end,
+            room_id,
+            required_device_ids,
+            required_capacity,
+            db,
+        )
 
-                if len(suggestions) >= max_suggestions:
-                    return suggestions
+        available_device_ids = []
+        if required_device_ids:
+            room_device_ids = [
+                rd.device_id for rd in room.room_devices if rd.is_permanent
+            ]
+            available_device_ids = [d for d in required_device_ids if d in room_device_ids]
+
+        scored_slots.append(
+            {
+                "room": room,
+                "start": start,
+                "end": end,
+                "score": score,
+                "reasons": reasons,
+                "has_devices": has_devices,
+                "capacity_match": capacity_match,
+                "available_device_ids": available_device_ids,
+            }
+        )
+
+    scored_slots.sort(key=lambda x: x["score"], reverse=True)
+
+    for slot in scored_slots[:max_suggestions]:
+        suggestions.append(
+            AlternativeSuggestion(
+                room_id=slot["room"].id,
+                room_name=slot["room"].name,
+                start_time=slot["start"],
+                end_time=slot["end"],
+                duration_minutes=duration_minutes,
+                score=round(slot["score"], 3),
+                score_level=_determine_score_level(slot["score"]),
+                score_reasons=slot["reasons"],
+                has_required_devices=slot["has_devices"],
+                capacity_match=slot["capacity_match"],
+            )
+        )
 
     return suggestions
 
@@ -317,6 +448,36 @@ def check_user_permission(
     return user.permission_level == PermissionLevel.BOOK
 
 
+def check_delegation_permission(
+    db: Session, delegator_id: int, delegate_id: int, room_id: Optional[int] = None
+) -> Optional[BookingDelegation]:
+    now = datetime.now()
+    query = db.query(BookingDelegation).filter(
+        BookingDelegation.delegator_id == delegator_id,
+        BookingDelegation.delegate_id == delegate_id,
+        BookingDelegation.is_active == True,
+    )
+
+    if room_id:
+        query = query.filter(
+            or_(
+                BookingDelegation.room_id == room_id,
+                BookingDelegation.room_id.is_(None),
+            )
+        )
+
+    delegations = query.all()
+
+    for delegation in delegations:
+        if delegation.start_date and delegation.start_date > now:
+            continue
+        if delegation.end_date and delegation.end_date < now:
+            continue
+        return delegation
+
+    return None
+
+
 def create_booking_with_devices(
     db: Session,
     booking_data: BookingCreate,
@@ -324,6 +485,7 @@ def create_booking_with_devices(
     start_time: datetime,
     end_time: datetime,
     series_id: Optional[str] = None,
+    delegation_id: Optional[int] = None,
 ) -> Booking:
     status = BookingStatus.CONFIRMED
     room = db.query(Room).filter(Room.id == booking_data.room_id).first()
@@ -355,6 +517,7 @@ def create_booking_with_devices(
         recurrence_interval=recurrence_interval,
         series_id=series_id,
         attendee_count=booking_data.attendee_count,
+        delegation_id=delegation_id,
     )
     db.add(db_booking)
     db.flush()
@@ -376,6 +539,7 @@ def create_recurring_bookings(
     db: Session,
     booking_data: BookingCreate,
     user_id: int,
+    delegation_id: Optional[int] = None,
 ) -> Tuple[List[Booking], List[Dict[str, Any]]]:
     created_bookings = []
     errors = []
@@ -427,7 +591,7 @@ def create_recurring_bookings(
                 continue
 
             booking = create_booking_with_devices(
-                db, booking_data, user_id, start, end, series_id
+                db, booking_data, user_id, start, end, series_id, delegation_id
             )
             created_bookings.append(booking)
 
@@ -442,3 +606,376 @@ def create_recurring_bookings(
 
     db.commit()
     return created_bookings, errors
+
+
+def skip_booking(
+    db: Session,
+    skip_data: BookingSkipCreate,
+    skipped_by: int,
+) -> Tuple[bool, str]:
+    if skip_data.booking_id:
+        booking = db.query(Booking).filter(Booking.id == skip_data.booking_id).first()
+        if not booking:
+            return False, "预订不存在"
+        if booking.status != BookingStatus.CONFIRMED:
+            return False, "只有已确认的预订才能跳过"
+        if booking.start_time < datetime.now():
+            return False, "不能跳过过去的预订"
+
+        booking.status = BookingStatus.SKIPPED
+        db_skip = BookingSkip(
+            booking_id=booking.id,
+            series_id=booking.series_id,
+            skip_date=skip_data.skip_date,
+            reason=skip_data.reason,
+            skipped_by=skipped_by,
+        )
+        db.add(db_skip)
+        db.commit()
+        return True, "成功跳过预订"
+
+    elif skip_data.series_id:
+        bookings = (
+            db.query(Booking)
+            .filter(
+                Booking.series_id == skip_data.series_id,
+                Booking.status == BookingStatus.CONFIRMED,
+                Booking.start_time >= datetime.now(),
+            )
+            .all()
+        )
+
+        target_date = skip_data.skip_date.date()
+        skipped_count = 0
+
+        for booking in bookings:
+            if booking.start_time.date() == target_date:
+                booking.status = BookingStatus.SKIPPED
+                db_skip = BookingSkip(
+                    booking_id=booking.id,
+                    series_id=skip_data.series_id,
+                    skip_date=skip_data.skip_date,
+                    reason=skip_data.reason,
+                    skipped_by=skipped_by,
+                )
+                db.add(db_skip)
+                skipped_count += 1
+
+        db.commit()
+        if skipped_count > 0:
+            return True, f"成功跳过 {skipped_count} 个预订"
+        else:
+            return False, "未找到可跳过的预订"
+
+    return False, "必须指定 booking_id 或 series_id"
+
+
+def create_delegation(
+    db: Session,
+    delegator_id: int,
+    delegation_data: BookingDelegationCreate,
+) -> BookingDelegation:
+    from datetime import timedelta as td
+
+    start_date = delegation_data.start_date or datetime.now()
+    end_date = delegation_data.end_date or datetime.now() + td(
+        days=settings.DELEGATION_DEFAULT_DURATION_DAYS
+    )
+
+    delegation = BookingDelegation(
+        delegator_id=delegator_id,
+        delegate_id=delegation_data.delegate_id,
+        room_id=delegation_data.room_id,
+        is_active=True,
+        start_date=start_date,
+        end_date=end_date,
+        reason=delegation_data.reason,
+    )
+    db.add(delegation)
+    db.commit()
+    db.refresh(delegation)
+    return delegation
+
+
+def get_user_delegations(
+    db: Session,
+    user_id: int,
+    as_delegator: bool = True,
+) -> List[BookingDelegation]:
+    if as_delegator:
+        return (
+            db.query(BookingDelegation)
+            .filter(BookingDelegation.delegator_id == user_id)
+            .order_by(BookingDelegation.created_at.desc())
+            .all()
+        )
+    else:
+        return (
+            db.query(BookingDelegation)
+            .filter(BookingDelegation.delegate_id == user_id)
+            .order_by(BookingDelegation.created_at.desc())
+            .all()
+        )
+
+
+def create_cancellation_request(
+    db: Session,
+    requester_id: int,
+    booking_ids: List[int],
+    reason: Optional[str] = None,
+    cancellation_type: str = "ids",
+    params: Optional[Dict[str, Any]] = None,
+) -> CancellationRequest:
+    request = CancellationRequest(
+        requester_id=requester_id,
+        status=CancellationRequestStatus.PENDING,
+        reason=reason,
+        booking_ids=booking_ids,
+        cancellation_type=cancellation_type,
+        params=params,
+    )
+    db.add(request)
+    db.commit()
+    db.refresh(request)
+    return request
+
+
+def approve_cancellation(
+    db: Session,
+    request_id: int,
+    approver_id: int,
+    approve: bool = True,
+    approval_reason: Optional[str] = None,
+) -> Tuple[bool, str, List[int]]:
+    request = (
+        db.query(CancellationRequest)
+        .filter(CancellationRequest.id == request_id)
+        .first()
+    )
+    if not request:
+        return False, "取消申请不存在", []
+
+    if request.status != CancellationRequestStatus.PENDING:
+        return False, "该申请已处理", []
+
+    cancelled_ids = []
+
+    if approve:
+        for booking_id in request.booking_ids:
+            booking = db.query(Booking).filter(Booking.id == booking_id).first()
+            if booking and booking.status == BookingStatus.CONFIRMED:
+                audit_log = CancellationAuditLog(
+                    request_id=request.id,
+                    booking_id=booking.id,
+                    original_status=booking.status,
+                    new_status=BookingStatus.CANCELLED,
+                    action_type="cancellation",
+                    action_by=approver_id,
+                )
+                db.add(audit_log)
+
+                booking.status = BookingStatus.CANCELLED
+                cancelled_ids.append(booking_id)
+
+        request.status = CancellationRequestStatus.APPROVED
+        request.approver_id = approver_id
+        request.approval_reason = approval_reason
+        request.approved_at = datetime.now()
+    else:
+        request.status = CancellationRequestStatus.REJECTED
+        request.approver_id = approver_id
+        request.approval_reason = approval_reason
+
+    db.commit()
+
+    if approve:
+        return True, f"已批准取消 {len(cancelled_ids)} 个预订", cancelled_ids
+    else:
+        return True, "已拒绝取消申请", []
+
+
+def rollback_cancellation(
+    db: Session,
+    request_id: int,
+    roller_back_id: int,
+    reason: Optional[str] = None,
+) -> Tuple[bool, str, List[int]]:
+    request = (
+        db.query(CancellationRequest)
+        .filter(CancellationRequest.id == request_id)
+        .first()
+    )
+    if not request:
+        return False, "取消申请不存在", []
+
+    if request.status != CancellationRequestStatus.APPROVED:
+        return False, "只有已批准的取消才能回滚", []
+
+    audit_logs = (
+        db.query(CancellationAuditLog)
+        .filter(
+            CancellationAuditLog.request_id == request_id,
+            CancellationAuditLog.action_type == "cancellation",
+        )
+        .all()
+    )
+
+    restored_ids = []
+    for audit_log in audit_logs:
+        booking = (
+            db.query(Booking).filter(Booking.id == audit_log.booking_id).first()
+        )
+        if booking and booking.status == BookingStatus.CANCELLED:
+            rollback_log = CancellationAuditLog(
+                request_id=request.id,
+                booking_id=booking.id,
+                original_status=booking.status,
+                new_status=audit_log.original_status,
+                action_type="rollback",
+                action_by=roller_back_id,
+            )
+            db.add(rollback_log)
+
+            booking.status = audit_log.original_status
+            restored_ids.append(booking.id)
+
+    request.status = CancellationRequestStatus.ROLLBACK
+    request.rolled_back_at = datetime.now()
+
+    db.commit()
+
+    return True, f"已回滚 {len(restored_ids)} 个预订", restored_ids
+
+
+def batch_cancel_with_audit(
+    db: Session,
+    cancel_request: BatchCancelRequest,
+    user_id: int,
+    is_admin: bool = False,
+) -> Tuple[List[int], List[Dict[str, Any]], Optional[CancellationRequest]]:
+    cancelled_ids = []
+    errors = []
+    cancellation_request = None
+
+    query = db.query(Booking).filter(Booking.status == BookingStatus.CONFIRMED)
+
+    if not is_admin:
+        query = query.filter(Booking.user_id == user_id)
+
+    if cancel_request.booking_ids:
+        query = query.filter(Booking.id.in_(cancel_request.booking_ids))
+    if cancel_request.series_id:
+        query = query.filter(Booking.series_id == cancel_request.series_id)
+    if cancel_request.start_date:
+        query = query.filter(Booking.start_time >= cancel_request.start_date)
+    if cancel_request.end_date:
+        query = query.filter(Booking.end_time <= cancel_request.end_date)
+    if cancel_request.user_id and is_admin:
+        query = query.filter(Booking.user_id == cancel_request.user_id)
+    if cancel_request.room_id:
+        query = query.filter(Booking.room_id == cancel_request.room_id)
+
+    bookings = query.all()
+
+    if cancel_request.require_approval:
+        booking_ids = [b.id for b in bookings]
+        cancellation_request = create_cancellation_request(
+            db,
+            user_id,
+            booking_ids,
+            cancel_request.reason,
+            "batch",
+            cancel_request.model_dump() if hasattr(cancel_request, 'model_dump') else None,
+        )
+        return [], [{"message": "已提交取消审批申请"}], cancellation_request
+
+    for booking in bookings:
+        try:
+            booking.status = BookingStatus.CANCELLED
+            cancelled_ids.append(booking.id)
+        except Exception as e:
+            errors.append({"booking_id": booking.id, "error": str(e)})
+
+    db.commit()
+    return cancelled_ids, errors, None
+
+
+def get_available_slots_with_devices(
+    db: Session,
+    room_ids: List[int],
+    start_date: datetime,
+    end_date: datetime,
+    duration_minutes: int,
+    device_ids: Optional[List[int]] = None,
+    min_capacity: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    slots = []
+    duration = timedelta(minutes=duration_minutes)
+
+    rooms = db.query(Room).filter(
+        Room.id.in_(room_ids),
+        Room.is_active == True,
+    )
+
+    if min_capacity:
+        rooms = rooms.filter(Room.capacity >= min_capacity)
+
+    rooms = rooms.all()
+
+    for room in rooms:
+        room_device_ids = [
+            rd.device_id for rd in room.room_devices if rd.is_permanent
+        ]
+
+        if device_ids:
+            has_all_devices = all(d in room_device_ids for d in device_ids)
+            available_devices = [d for d in device_ids if d in room_device_ids]
+        else:
+            has_all_devices = True
+            available_devices = room_device_ids
+
+        if device_ids and not has_all_devices:
+            continue
+
+        bookings = (
+            db.query(Booking)
+            .filter(
+                Booking.room_id == room.id,
+                Booking.status == BookingStatus.CONFIRMED,
+                Booking.start_time >= start_date,
+                Booking.end_time <= end_date,
+            )
+            .order_by(Booking.start_time)
+            .all()
+        )
+
+        current_time = start_date
+        for booking in bookings:
+            if current_time + duration <= booking.start_time:
+                slots.append(
+                    {
+                        "room_id": room.id,
+                        "room_name": room.name,
+                        "start_time": current_time,
+                        "end_time": current_time + duration,
+                        "duration_minutes": duration_minutes,
+                        "has_all_devices": has_all_devices,
+                        "available_device_ids": available_devices,
+                    }
+                )
+            current_time = max(current_time, booking.end_time)
+
+        if current_time + duration <= end_date:
+            slots.append(
+                {
+                    "room_id": room.id,
+                    "room_name": room.name,
+                    "start_time": current_time,
+                    "end_time": current_time + duration,
+                    "duration_minutes": duration_minutes,
+                    "has_all_devices": has_all_devices,
+                    "available_device_ids": available_devices,
+                }
+            )
+
+    return slots

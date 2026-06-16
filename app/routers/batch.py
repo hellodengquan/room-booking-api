@@ -1,20 +1,29 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Dict, Any
 from fastapi import APIRouter, Depends, HTTPException, Body
 from sqlalchemy.orm import Session
 from sqlalchemy import and_
 
 from app.database import get_db
-from app.dependencies import get_current_active_user
+from app.dependencies import get_current_active_user, require_admin_permission
 from app.models.models import (
     Booking,
     BookingStatus,
     User,
     PermissionLevel,
+    CancellationRequest,
+    CancellationRequestStatus,
+    CancellationAuditLog,
 )
 from app.schemas.schemas import (
     BatchCancelRequest,
     BatchCancelResponse,
+    RollbackRequest,
+    RollbackResponse,
+)
+from app.services.booking_service import (
+    batch_cancel_with_audit,
+    rollback_cancellation,
 )
 
 router = APIRouter(prefix="/batch", tags=["批量操作"])
@@ -40,74 +49,46 @@ async def batch_cancel_bookings(
             detail="请提供至少一个筛选条件或设置 cancel_all=True",
         )
 
-    query = db.query(Booking).filter(
-        Booking.status != BookingStatus.CANCELLED,
-        Booking.start_time >= datetime.now(),
-    )
+    is_admin = current_user.permission_level == PermissionLevel.ADMIN
 
-    if cancel_request.booking_ids:
-        query = query.filter(Booking.id.in_(cancel_request.booking_ids))
-
-    if cancel_request.series_id:
-        query = query.filter(Booking.series_id == cancel_request.series_id)
-
-    if cancel_request.start_date:
-        query = query.filter(Booking.start_time >= cancel_request.start_date)
-
-    if cancel_request.end_date:
-        query = query.filter(Booking.end_time <= cancel_request.end_date)
-
-    if cancel_request.user_id:
-        query = query.filter(Booking.user_id == cancel_request.user_id)
-
-    if cancel_request.room_id:
-        query = query.filter(Booking.room_id == cancel_request.room_id)
-
-    if (
-        current_user.permission_level != PermissionLevel.ADMIN
-        and not cancel_request.cancel_all
-    ):
-        query = query.filter(Booking.user_id == current_user.id)
-
-    if cancel_request.cancel_all and current_user.permission_level != PermissionLevel.ADMIN:
-        query = query.filter(Booking.user_id == current_user.id)
-
-    bookings_to_cancel = query.all()
-
-    cancelled_ids: List[int] = []
-    errors: List[Dict[str, Any]] = []
-
-    for booking in bookings_to_cancel:
-        try:
-            if (
-                current_user.permission_level != PermissionLevel.ADMIN
-                and booking.user_id != current_user.id
-            ):
-                errors.append(
-                    {
-                        "booking_id": booking.id,
-                        "error": "没有权限取消此预订",
-                    }
-                )
-                continue
-
-            booking.status = BookingStatus.CANCELLED
-            cancelled_ids.append(booking.id)
-        except Exception as e:
-            errors.append(
-                {
-                    "booking_id": booking.id,
-                    "error": str(e),
-                }
+    if cancel_request.require_approval and not is_admin:
+        if cancel_request.user_id and cancel_request.user_id != current_user.id:
+            raise HTTPException(
+                status_code=403,
+                detail="不能为其他用户提交取消申请",
             )
 
-    db.commit()
+    cancelled_ids, errors, cancel_req = batch_cancel_with_audit(
+        db, cancel_request, current_user.id, is_admin
+    )
 
     return BatchCancelResponse(
         cancelled_count=len(cancelled_ids),
         cancelled_ids=cancelled_ids,
         failed_count=len(errors),
         errors=errors,
+        rollback_supported=True,
+        audit_log_id=cancel_req.id if cancel_req else None,
+    )
+
+
+@router.post("/cancel/rollback", response_model=RollbackResponse)
+async def rollback_batch_cancel(
+    rollback_in: RollbackRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin_permission),
+):
+    success, message, restored_ids = rollback_cancellation(
+        db, rollback_in.request_id, current_user.id, rollback_in.reason
+    )
+    if not success:
+        raise HTTPException(status_code=400, detail=message)
+
+    return RollbackResponse(
+        success=success,
+        restored_count=len(restored_ids),
+        restored_ids=restored_ids,
+        message=message,
     )
 
 
