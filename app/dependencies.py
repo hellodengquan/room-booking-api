@@ -132,3 +132,56 @@ def require_admin_permission(
 
 require_booking = require_room_permission(PermissionLevel.BOOK)
 require_admin = require_room_permission(PermissionLevel.ADMIN)
+
+
+def require_advanced_permission(sub_module: str, access_level: str = "read"):
+    def permission_dependency(
+        current_user: User = Depends(get_current_active_user),
+        db: Session = Depends(get_db),
+    ) -> User:
+        from app.config import settings
+        from app.models.models import AdvancedPermission
+
+        if not settings.ADVANCED_PERMISSION_STRICT:
+            if current_user.permission_level == PermissionLevel.ADMIN:
+                return current_user
+            if access_level == "read":
+                return current_user
+
+        if current_user.permission_level == PermissionLevel.ADMIN:
+            return current_user
+
+        perm = (
+            db.query(AdvancedPermission)
+            .filter(
+                AdvancedPermission.user_id == current_user.id,
+                AdvancedPermission.sub_module == sub_module,
+            )
+            .first()
+        )
+
+        if not perm:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"无权访问高级模块: {sub_module}",
+            )
+
+        if access_level == "read" and not perm.can_read:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"无权读取模块: {sub_module}",
+            )
+        elif access_level == "write" and not perm.can_write:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"无权写入模块: {sub_module}",
+            )
+        elif access_level == "admin" and not perm.can_admin:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"无权管理模块: {sub_module}",
+            )
+
+        return current_user
+
+    return permission_dependency

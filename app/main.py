@@ -8,7 +8,7 @@ from app.routers import auth, rooms, bookings, calendar, batch, delegations, can
 app = FastAPI(
     title=settings.PROJECT_NAME,
     description="会议室预订系统 API",
-    version="2.1.0",
+    version="2.2.0",
 )
 
 app.add_middleware(
@@ -29,7 +29,7 @@ def startup_event():
 async def root():
     return {
         "message": "会议室预订系统 API",
-        "version": "2.1.0",
+        "version": "2.2.0",
         "docs": "/docs",
         "api_prefix": settings.API_V1_STR,
         "features": [
@@ -59,7 +59,7 @@ async def root():
 
 @app.get("/health", tags=["健康检查"])
 async def health_check():
-    return {"status": "healthy", "version": "2.1.0"}
+    return {"status": "healthy", "version": "2.2.0"}
 
 
 app.include_router(auth.router, prefix=settings.API_V1_STR)

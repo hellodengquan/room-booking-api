@@ -1242,12 +1242,12 @@ class TestCoverage:
         data = response.json()
         assert "features" in data
         assert len(data["features"]) > 5
-        assert data["version"] == "2.1.0"
+        assert data["version"] == "2.2.0"
 
     def test_health_check_v2(self, client):
         response = client.get("/health")
         assert response.status_code == 200
-        assert response.json()["version"] == "2.1.0"
+        assert response.json()["version"] == "2.2.0"
 
 
 class TestSuggestionConfig:
@@ -1874,3 +1874,257 @@ class TestCoverageModuleTargets:
         assert "configs" in data
         assert "configured_targets" in data
         assert "global_target" in data
+
+
+class TestAdvancedPermissionIsolation:
+    def test_set_and_get_permissions(self, client, test_user_id, admin_headers, db_session):
+        response = client.post(
+            "/api/v1/advanced/permissions",
+            json={
+                "user_id": test_user_id,
+                "sub_module": "calibration",
+                "can_read": True,
+                "can_write": True,
+                "can_admin": False,
+            },
+            headers=admin_headers,
+        )
+        assert response.status_code == 200
+        assert response.json()["can_read"] is True
+        assert response.json()["can_write"] is True
+
+        response = client.get(
+            f"/api/v1/advanced/permissions/{test_user_id}",
+            headers=admin_headers,
+        )
+        assert response.status_code == 200
+        assert len(response.json()) >= 1
+
+    def test_permission_settings_exist(self):
+        from app.config import settings
+        assert hasattr(settings, "ADVANCED_PERMISSION_STRICT")
+
+
+class TestABTestConfidence:
+    def test_record_result_and_compute(self, client, auth_headers, admin_headers, db_session):
+        from app.models.models import ABTestResult
+
+        for i in range(35):
+            r = ABTestResult(
+                experiment_name="suggestion_weights",
+                variant="control" if i % 2 == 0 else "variant_a",
+                user_id=i + 100,
+                metric_key="suggestion_accepted",
+                metric_value=1.0 if i % 3 == 0 else 0.0,
+            )
+            db_session.add(r)
+        db_session.commit()
+
+        response = client.get(
+            "/api/v1/advanced/ab-test/confidence",
+            params={"experiment_name": "suggestion_weights", "metric_key": "suggestion_accepted"},
+            headers=admin_headers,
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert "variant_stats" in data
+        assert "min_sample_size" in data
+        assert "confidence_level" in data
+        assert data["min_sample_size"] == settings.AB_TEST_MIN_SAMPLE_SIZE
+
+    def test_record_ab_result_endpoint(self, client, auth_headers):
+        response = client.post(
+            "/api/v1/advanced/ab-test/results",
+            params={
+                "experiment_name": "suggestion_weights",
+                "variant": "control",
+                "metric_key": "click_rate",
+                "metric_value": 0.75,
+            },
+            headers=auth_headers,
+        )
+        assert response.status_code == 200
+
+
+class TestTenantConfigHotReload:
+    def test_hot_reload(self, client, admin_headers):
+        client.post(
+            "/api/v1/advanced/tenant-config/tenant_reload",
+            params={"config_key": "test_hot", "config_value": "before"},
+            headers=admin_headers,
+        )
+
+        response = client.post(
+            "/api/v1/advanced/tenant-config/tenant_reload/hot-reload",
+            headers=admin_headers,
+        )
+        assert response.status_code == 200
+        assert response.json()["success"] is True
+        assert "reloaded_keys" in response.json()
+
+    def test_tenant_config_cache_ttl(self):
+        from app.config import settings
+        assert hasattr(settings, "TENANT_CONFIG_CACHE_TTL_SECONDS")
+        assert settings.TENANT_CONFIG_CACHE_TTL_SECONDS > 0
+
+
+class TestCalibrationOutlierRemoval:
+    def test_detect_outliers(self, client, test_user_id, admin_headers, db_session):
+        from app.models.models import ScoreCalibrationSample, SuggestionScoreLevel
+
+        for score in [0.5, 0.6, 0.65, 0.7, 0.72, 0.75, 0.8, 0.85, 0.99, -0.5]:
+            sample = ScoreCalibrationSample(
+                original_score=score,
+                score_level=SuggestionScoreLevel.GOOD,
+            )
+            db_session.add(sample)
+        db_session.commit()
+
+        response = client.get(
+            "/api/v1/advanced/calibration/outliers",
+            headers=admin_headers,
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert "outlier_ids" in data
+        assert "outlier_count" in data
+        assert "method" in data
+        assert data["method"] == "iqr"
+
+    def test_remove_outliers(self, client, test_user_id, admin_headers, db_session):
+        from app.models.models import ScoreCalibrationSample, SuggestionScoreLevel
+
+        sample = ScoreCalibrationSample(
+            original_score=0.5,
+            score_level=SuggestionScoreLevel.GOOD,
+        )
+        db_session.add(sample)
+        db_session.commit()
+        sample_id = sample.id
+
+        response = client.post(
+            "/api/v1/advanced/calibration/outliers/remove",
+            json=[sample_id],
+            headers=admin_headers,
+        )
+        assert response.status_code == 200
+        assert response.json()["deleted_count"] >= 0
+
+
+class TestSnapshotRetentionWindow:
+    def test_init_retention_policies(self, client, admin_headers):
+        response = client.post(
+            "/api/v1/advanced/cancellation-snapshots/retention-policies/init",
+            headers=admin_headers,
+        )
+        assert response.status_code == 200
+        assert response.json()["initialized"] >= 0
+
+    def test_get_retention_policies(self, client, admin_headers):
+        client.post(
+            "/api/v1/advanced/cancellation-snapshots/retention-policies/init",
+            headers=admin_headers,
+        )
+
+        response = client.get(
+            "/api/v1/advanced/cancellation-snapshots/retention-policies",
+            headers=admin_headers,
+        )
+        assert response.status_code == 200
+
+
+class TestCoverageSLAAlertChannel:
+    def test_check_coverage_generates_alerts(self, client, admin_headers, db_session):
+        client.post(
+            "/api/v1/advanced/coverage-sla/init",
+            headers=admin_headers,
+        )
+
+        response = client.post(
+            "/api/v1/advanced/coverage-sla/check",
+            json={"services": 60.0, "routers": 50.0},
+            headers=admin_headers,
+        )
+        assert response.status_code == 200
+        assert "alerts_generated" in response.json()
+
+    def test_list_coverage_alerts(self, client, admin_headers):
+        response = client.get(
+            "/api/v1/advanced/coverage-sla/alerts",
+            headers=admin_headers,
+        )
+        assert response.status_code == 200
+
+    def test_alert_channel_config(self):
+        from app.config import settings
+        assert hasattr(settings, "COVERAGE_SLA_ALERT_CHANNEL")
+        assert settings.COVERAGE_SLA_ALERT_CHANNEL in ("log", "webhook", "notification")
+
+
+class TestDeviceBonusPushStrategy:
+    def test_push_device_bonus(self, client, admin_headers):
+        response = client.post(
+            "/api/v1/advanced/device-bonus/push",
+            headers=admin_headers,
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert "strategy" in data
+        assert "affected_users" in data
+
+    def test_get_push_logs(self, client, admin_headers):
+        client.post(
+            "/api/v1/advanced/device-bonus/push",
+            headers=admin_headers,
+        )
+
+        response = client.get(
+            "/api/v1/advanced/device-bonus/push-logs",
+            headers=admin_headers,
+        )
+        assert response.status_code == 200
+
+
+class TestCoverageDashboard:
+    def test_record_and_get_dashboard(self, client, admin_headers):
+        response = client.post(
+            "/api/v1/advanced/coverage-dashboard/record",
+            json={
+                "module_name": "services",
+                "line_coverage": 78.5,
+                "branch_coverage": 65.0,
+                "statement_count": 450,
+                "covered_count": 354,
+            },
+            headers=admin_headers,
+        )
+        assert response.status_code == 200
+
+        response = client.get(
+            "/api/v1/advanced/coverage-dashboard",
+            headers=admin_headers,
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert "modules" in data
+        assert data["enabled"] is True
+
+    def test_dashboard_by_module(self, client, admin_headers):
+        response = client.get(
+            "/api/v1/advanced/coverage-dashboard",
+            params={"module_name": "services"},
+            headers=admin_headers,
+        )
+        assert response.status_code == 200
+
+
+class TestVersionUpdate:
+    def test_root_version_2_2(self, client):
+        response = client.get("/")
+        assert response.status_code == 200
+        assert response.json()["version"] == "2.2.0"
+
+    def test_health_version_2_2(self, client):
+        response = client.get("/health")
+        assert response.status_code == 200
+        assert response.json()["version"] == "2.2.0"

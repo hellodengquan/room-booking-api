@@ -413,3 +413,94 @@ class CoverageSLAConfig(Base):
     description = Column(Text)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class AdvancedPermission(Base):
+    __tablename__ = "advanced_permissions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    sub_module = Column(String(100), nullable=False)
+    can_read = Column(Boolean, default=False)
+    can_write = Column(Boolean, default=False)
+    can_admin = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "sub_module", name="uq_user_submodule"),
+    )
+
+
+class ABTestResult(Base):
+    __tablename__ = "ab_test_results"
+
+    id = Column(Integer, primary_key=True, index=True)
+    experiment_name = Column(String(100), nullable=False, index=True)
+    variant = Column(String(50), nullable=False)
+    user_id = Column(Integer, nullable=False)
+    metric_key = Column(String(100), nullable=False)
+    metric_value = Column(Float, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class TenantConfigAudit(Base):
+    __tablename__ = "tenant_config_audits"
+
+    id = Column(Integer, primary_key=True, index=True)
+    tenant_id = Column(String(100), nullable=False, index=True)
+    config_key = Column(String(100), nullable=False)
+    old_value = Column(JSON)
+    new_value = Column(JSON)
+    changed_by = Column(Integer)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class SnapshotRetentionPolicy(Base):
+    __tablename__ = "snapshot_retention_policies"
+
+    id = Column(Integer, primary_key=True, index=True)
+    window_days = Column(Integer, nullable=False)
+    policy_name = Column(String(100), nullable=False)
+    action = Column(String(50), default="archive")
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class CoverageAlert(Base):
+    __tablename__ = "coverage_alerts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    module_name = Column(String(100), nullable=False)
+    current_coverage = Column(Float, nullable=False)
+    target_coverage = Column(Float, nullable=False)
+    alert_level = Column(String(20), nullable=False)
+    channel = Column(String(50), nullable=False)
+    message = Column(Text)
+    is_resolved = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    resolved_at = Column(DateTime)
+
+
+class DeviceBonusPushLog(Base):
+    __tablename__ = "device_bonus_push_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    config_snapshot = Column(JSON, nullable=False)
+    strategy = Column(String(50), nullable=False)
+    pushed_by = Column(Integer)
+    affected_users = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class CoverageDashboard(Base):
+    __tablename__ = "coverage_dashboards"
+
+    id = Column(Integer, primary_key=True, index=True)
+    module_name = Column(String(100), nullable=False)
+    line_coverage = Column(Float, default=0.0)
+    branch_coverage = Column(Float, default=0.0)
+    statement_count = Column(Integer, default=0)
+    covered_count = Column(Integer, default=0)
+    missing_lines = Column(Text)
+    recorded_at = Column(DateTime, default=datetime.utcnow)

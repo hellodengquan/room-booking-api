@@ -41,6 +41,17 @@ class Settings(BaseSettings):
     CALIBRATION_SAMPLE_ENABLED: bool = True
     CANCELLATION_AUDIT_SNAPSHOT_RETENTION_DAYS: int = 365
     COVERAGE_SLA_MODULES: str = "services:85,routers:70,models:90,schemas:80"
+    ADVANCED_PERMISSION_STRICT: bool = True
+    AB_TEST_MIN_SAMPLE_SIZE: int = 30
+    AB_TEST_CONFIDENCE_LEVEL: float = 0.95
+    TENANT_CONFIG_CACHE_TTL_SECONDS: int = 300
+    CALIBRATION_OUTLIER_METHOD: str = "iqr"
+    CALIBRATION_OUTLIER_THRESHOLD: float = 1.5
+    SNAPSHOT_RETENTION_WINDOW_DAYS: str = "30,90,365"
+    COVERAGE_SLA_ALERT_CHANNEL: str = "log"
+    COVERAGE_SLA_WEBHOOK_URL: str = ""
+    DEVICE_BONUS_PUSH_STRATEGY: str = "on_change"
+    COVERAGE_DASHBOARD_ENABLED: bool = True
 
 
 settings = Settings()
