@@ -297,3 +297,119 @@ class CancellationAuditLog(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     request = relationship("CancellationRequest", back_populates="audit_logs")
+
+
+class NotificationType(PyEnum):
+    DST_REMINDER = "dst_reminder"
+    DELEGATION_REVOKED = "delegation_revoked"
+    CANCELLATION_APPROVED = "cancellation_approved"
+    CANCELLATION_REJECTED = "cancellation_rejected"
+    SYSTEM = "system"
+
+
+class NotificationStatus(PyEnum):
+    UNREAD = "unread"
+    READ = "read"
+    DISMISSED = "dismissed"
+
+
+class Notification(Base):
+    __tablename__ = "notifications"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    title = Column(String(200), nullable=False)
+    content = Column(Text)
+    notification_type = Column(Enum(NotificationType), nullable=False)
+    status = Column(Enum(NotificationStatus), default=NotificationStatus.UNREAD)
+    related_id = Column(Integer)
+    related_type = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    read_at = Column(DateTime)
+
+
+class DelegationAuditLog(Base):
+    __tablename__ = "delegation_audit_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    delegation_id = Column(Integer, ForeignKey("booking_delegations.id"), nullable=False)
+    action_type = Column(String(50), nullable=False)
+    actor_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    old_value = Column(JSON)
+    new_value = Column(JSON)
+    reason = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class ABTestVariant(PyEnum):
+    CONTROL = "control"
+    VARIANT_A = "variant_a"
+    VARIANT_B = "variant_b"
+    VARIANT_C = "variant_c"
+
+
+class ABTestExperiment(Base):
+    __tablename__ = "ab_test_experiments"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(100), unique=True, nullable=False)
+    description = Column(Text)
+    is_active = Column(Boolean, default=False)
+    variants = Column(JSON, nullable=False)
+    traffic_split = Column(JSON, nullable=False)
+    start_date = Column(DateTime)
+    end_date = Column(DateTime)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class TenantConfig(Base):
+    __tablename__ = "tenant_configs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    tenant_id = Column(String(100), unique=True, nullable=False, index=True)
+    config_key = Column(String(100), nullable=False)
+    config_value = Column(JSON)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "config_key", name="uq_tenant_config"),
+    )
+
+
+class ScoreCalibrationSample(Base):
+    __tablename__ = "score_calibration_samples"
+
+    id = Column(Integer, primary_key=True, index=True)
+    booking_id = Column(Integer, ForeignKey("bookings.id"))
+    original_score = Column(Float, nullable=False)
+    adjusted_score = Column(Float)
+    score_level = Column(Enum(SuggestionScoreLevel))
+    user_feedback = Column(String(50))
+    features = Column(JSON)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class CancellationAuditSnapshot(Base):
+    __tablename__ = "cancellation_audit_snapshots"
+
+    id = Column(Integer, primary_key=True, index=True)
+    snapshot_date = Column(DateTime, nullable=False, index=True)
+    booking_id = Column(Integer, ForeignKey("bookings.id"), nullable=False)
+    booking_snapshot = Column(JSON, nullable=False)
+    request_id = Column(Integer, ForeignKey("cancellation_requests.id"))
+    audit_log_ids = Column(JSON)
+    snapshot_type = Column(String(50), default="cancellation")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class CoverageSLAConfig(Base):
+    __tablename__ = "coverage_sla_configs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    module_name = Column(String(100), unique=True, nullable=False)
+    target_coverage = Column(Float, nullable=False)
+    is_active = Column(Boolean, default=True)
+    description = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

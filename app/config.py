@@ -29,6 +29,18 @@ class Settings(BaseSettings):
     CANCELLATION_APPROVAL_TIMEOUT_ACTION: str = "reject"
     COVERAGE_SLA_TARGET: float = 75.0
     ENABLE_DST_HANDLING: bool = True
+    DEVICE_BONUS_CAP_ENABLED: bool = True
+    DEVICE_BONUS_BASE_CAP: float = 0.3
+    DEVICE_BONUS_CAP_PER_DEVICE: float = 0.05
+    DEVICE_BONUS_MAX_CAP: float = 0.6
+    DST_NOTIFICATION_ENABLED: bool = True
+    DST_NOTIFICATION_DAYS_BEFORE: int = 7
+    DELEGATION_AUDIT_ENABLED: bool = True
+    AB_TEST_ENABLED: bool = False
+    AB_TEST_DEFAULT_VARIANT: str = "control"
+    CALIBRATION_SAMPLE_ENABLED: bool = True
+    CANCELLATION_AUDIT_SNAPSHOT_RETENTION_DAYS: int = 365
+    COVERAGE_SLA_MODULES: str = "services:85,routers:70,models:90,schemas:80"
 
 
 settings = Settings()

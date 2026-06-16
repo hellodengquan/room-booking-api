@@ -16,6 +16,12 @@ from app.services.booking_service import (
     get_user_delegations,
     check_delegation_permission,
 )
+from app.services.advanced_service import (
+    log_delegation_audit,
+    get_delegation_audit_logs,
+    create_notification,
+)
+from app.models.models import NotificationType
 
 router = APIRouter(prefix="/delegations", tags=["委托代订"])
 
@@ -173,6 +179,14 @@ async def revoke_delegation(
         )
 
     from datetime import datetime as dt
+    from app.config import settings
+
+    old_value = {
+        "is_active": delegation.is_active,
+        "revoked_at": None,
+        "revoked_by": None,
+        "revocation_reason": None,
+    }
 
     delegation.is_active = False
     delegation.revoked_at = dt.utcnow()
@@ -181,4 +195,55 @@ async def revoke_delegation(
 
     db.commit()
     db.refresh(delegation)
+
+    if settings.DELEGATION_AUDIT_ENABLED:
+        new_value = {
+            "is_active": delegation.is_active,
+            "revoked_at": delegation.revoked_at.isoformat() if delegation.revoked_at else None,
+            "revoked_by": delegation.revoked_by,
+            "revocation_reason": delegation.revocation_reason,
+        }
+        log_delegation_audit(
+            db,
+            delegation_id=delegation.id,
+            action_type="revoke",
+            actor_id=current_user.id,
+            old_value=old_value,
+            new_value=new_value,
+            reason=revoke_in.reason,
+        )
+
+    create_notification(
+        db,
+        user_id=delegation.delegate_id,
+        title="委托已撤销",
+        content=f"{current_user.full_name or current_user.username} 已撤销对您的代订委托",
+        notification_type=NotificationType.DELEGATION_REVOKED,
+        related_id=delegation.id,
+        related_type="delegation",
+    )
+
     return delegation
+
+
+@router.get("/{delegation_id}/audit-logs")
+async def get_delegation_audit(
+    delegation_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    delegation = (
+        db.query(BookingDelegation)
+        .filter(BookingDelegation.id == delegation_id)
+        .first()
+    )
+    if not delegation:
+        raise HTTPException(status_code=404, detail="委托不存在")
+
+    if delegation.delegator_id != current_user.id and delegation.delegate_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="无权查看该委托的审计日志",
+        )
+
+    return get_delegation_audit_logs(db, delegation_id)

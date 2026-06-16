@@ -270,10 +270,18 @@ def _calculate_suggestion_score(
             reasons.append("所有设备可用")
         elif available_count > 0:
             base_device_score = available_count / total_devices
+            if settings.DEVICE_BONUS_CAP_ENABLED:
+                dynamic_cap = min(
+                    settings.DEVICE_BONUS_BASE_CAP
+                    + total_devices * settings.DEVICE_BONUS_CAP_PER_DEVICE,
+                    settings.DEVICE_BONUS_MAX_CAP,
+                )
+            else:
+                dynamic_cap = 0.3
             device_bonus = min(
-                available_count * settings.DEVICE_MATCH_WEIGHT_PER_DEVICE,
-                0.3,
-            )
+                    available_count * settings.DEVICE_MATCH_WEIGHT_PER_DEVICE,
+                    dynamic_cap,
+                )
             device_score = min(1.0, base_device_score * 0.5 + device_bonus)
             reasons.append(f"部分设备可用 ({available_count}/{total_devices})")
             has_devices = False

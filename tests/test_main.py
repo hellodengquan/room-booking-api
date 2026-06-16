@@ -1242,12 +1242,12 @@ class TestCoverage:
         data = response.json()
         assert "features" in data
         assert len(data["features"]) > 5
-        assert data["version"] == "2.0.0"
+        assert data["version"] == "2.1.0"
 
     def test_health_check_v2(self, client):
         response = client.get("/health")
         assert response.status_code == 200
-        assert response.json()["version"] == "2.0.0"
+        assert response.json()["version"] == "2.1.0"
 
 
 class TestSuggestionConfig:
@@ -1521,3 +1521,356 @@ class TestCoverageSLA:
             "pytest.ini",
         )
         assert os.path.exists(ini_path)
+
+
+class TestDeviceBonusAutoTuning:
+    def test_device_bonus_config_endpoint(self, client, auth_headers):
+        response = client.get(
+            "/api/v1/advanced/device-bonus/config",
+            headers=auth_headers,
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert "enabled" in data
+        assert "base_cap" in data
+        assert "max_cap" in data
+        assert "per_device_weight" in data
+
+    def test_device_bonus_settings_exist(self):
+        from app.config import settings
+
+        assert hasattr(settings, "DEVICE_BONUS_CAP_ENABLED")
+        assert hasattr(settings, "DEVICE_BONUS_BASE_CAP")
+        assert hasattr(settings, "DEVICE_BONUS_CAP_PER_DEVICE")
+        assert hasattr(settings, "DEVICE_BONUS_MAX_CAP")
+        assert settings.DEVICE_BONUS_MAX_CAP >= settings.DEVICE_BONUS_BASE_CAP
+
+
+class TestNotifications:
+    def test_list_notifications(self, client, auth_headers):
+        response = client.get(
+            "/api/v1/advanced/notifications",
+            headers=auth_headers,
+        )
+        assert response.status_code == 200
+        assert isinstance(response.json(), list)
+
+    def test_notification_with_dst_type(self, client, test_user_id, auth_headers, db_session):
+        from app.models.models import Notification, NotificationType, NotificationStatus
+
+        notification = Notification(
+            user_id=test_user_id,
+            title="测试通知",
+            content="测试内容",
+            notification_type=NotificationType.DST_REMINDER,
+            status=NotificationStatus.UNREAD,
+        )
+        db_session.add(notification)
+        db_session.commit()
+        notification_id = notification.id
+
+        response = client.get(
+            "/api/v1/advanced/notifications",
+            headers=auth_headers,
+        )
+        assert response.status_code == 200
+        assert len(response.json()) >= 1
+
+    def test_mark_notification_read(self, client, test_user_id, auth_headers, db_session):
+        from app.models.models import Notification, NotificationType, NotificationStatus
+
+        notification = Notification(
+            user_id=test_user_id,
+            title="未读通知",
+            content="测试内容",
+            notification_type=NotificationType.SYSTEM,
+            status=NotificationStatus.UNREAD,
+        )
+        db_session.add(notification)
+        db_session.commit()
+        notification_id = notification.id
+
+        response = client.post(
+            f"/api/v1/advanced/notifications/{notification_id}/read",
+            headers=auth_headers,
+        )
+        assert response.status_code == 200
+        assert response.json()["success"] is True
+
+
+class TestDelegationRevokeAudit:
+    def test_revoke_creates_audit_log(self, client, test_user_id, test_room_id, auth_headers, db_session):
+        from app.models.models import User, BookingDelegation, DelegationAuditLog
+
+        delegate_user = User(
+            username="revokeaudittest",
+            email="revokeaudit@example.com",
+            full_name="Revoke Audit User",
+            hashed_password=get_password_hash("test123"),
+            permission_level=PermissionLevel.BOOK,
+        )
+        db_session.add(delegate_user)
+        db_session.flush()
+        delegate_id = delegate_user.id
+
+        delegation = BookingDelegation(
+            delegator_id=test_user_id,
+            delegate_id=delegate_id,
+            room_id=test_room_id,
+            is_active=True,
+        )
+        db_session.add(delegation)
+        db_session.commit()
+        delegation_id = delegation.id
+
+        response = client.post(
+            f"/api/v1/delegations/{delegation_id}/revoke",
+            json={"reason": "审计测试"},
+            headers=auth_headers,
+        )
+        assert response.status_code == 200
+
+        audit_logs = db_session.query(DelegationAuditLog).filter(
+            DelegationAuditLog.delegation_id == delegation_id
+        ).all()
+        assert len(audit_logs) >= 1
+        assert audit_logs[0].action_type == "revoke"
+
+    def test_get_delegation_audit_logs(self, client, test_user_id, test_room_id, auth_headers, db_session):
+        from app.models.models import User, BookingDelegation
+
+        delegate_user = User(
+            username="auditlistuser",
+            email="auditlist@example.com",
+            full_name="Audit List User",
+            hashed_password=get_password_hash("test123"),
+            permission_level=PermissionLevel.BOOK,
+        )
+        db_session.add(delegate_user)
+        db_session.flush()
+        delegate_id = delegate_user.id
+
+        delegation = BookingDelegation(
+            delegator_id=test_user_id,
+            delegate_id=delegate_id,
+            room_id=test_room_id,
+            is_active=True,
+        )
+        db_session.add(delegation)
+        db_session.commit()
+        delegation_id = delegation.id
+
+        client.post(
+            f"/api/v1/delegations/{delegation_id}/revoke",
+            json={},
+            headers=auth_headers,
+        )
+
+        response = client.get(
+            f"/api/v1/delegations/{delegation_id}/audit-logs",
+            headers=auth_headers,
+        )
+        assert response.status_code == 200
+        assert isinstance(response.json(), list)
+        assert len(response.json()) >= 1
+
+
+class TestTenantConfig:
+    def test_set_and_get_tenant_config(self, client, admin_headers):
+        response = client.post(
+            "/api/v1/advanced/tenant-config/tenant_001",
+            params={"config_key": "test_key", "config_value": "test_value"},
+            headers=admin_headers,
+        )
+        assert response.status_code == 200
+
+        response = client.get(
+            "/api/v1/advanced/tenant-config/tenant_001",
+            params={"config_key": "test_key"},
+            headers=admin_headers,
+        )
+        assert response.status_code == 200
+        assert response.json()["value"] == "test_value"
+
+    def test_tenant_approval_timeout(self, client, admin_headers):
+        client.post(
+            "/api/v1/advanced/tenant-config/tenant_002",
+            params={"config_key": "cancellation_approval_timeout_hours", "config_value": 72},
+            headers=admin_headers,
+        )
+
+        response = client.get(
+            "/api/v1/advanced/tenant-config/tenant_002/approval-timeout",
+            headers=admin_headers,
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert "timeout_hours" in data
+        assert "timeout_action" in data
+
+
+class TestCalibrationSamples:
+    def test_add_calibration_sample(self, client, auth_headers):
+        response = client.post(
+            "/api/v1/advanced/calibration/samples",
+            params={
+                "original_score": 0.75,
+                "adjusted_score": 0.8,
+                "score_level": "good",
+                "user_feedback": "helpful",
+            },
+            headers=auth_headers,
+        )
+        assert response.status_code == 200
+        assert response.json()["original_score"] == 0.75
+
+    def test_get_calibration_stats(self, client, test_user_id, admin_headers, db_session):
+        from app.models.models import ScoreCalibrationSample, SuggestionScoreLevel
+
+        for i in range(5):
+            sample = ScoreCalibrationSample(
+                original_score=0.6 + i * 0.05,
+                score_level=SuggestionScoreLevel.GOOD if i % 2 == 0 else SuggestionScoreLevel.FAIR,
+                user_feedback="useful" if i % 2 == 0 else "not_useful",
+            )
+            db_session.add(sample)
+        db_session.commit()
+
+        response = client.get(
+            "/api/v1/advanced/calibration/stats",
+            headers=admin_headers,
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert "total_samples" in data
+        assert data["total_samples"] >= 5
+        assert "level_distribution" in data
+        assert "feedback_distribution" in data
+
+
+class TestABTestExperiment:
+    def test_get_ab_test_variant(self, client, auth_headers):
+        response = client.get(
+            "/api/v1/advanced/ab-test/variant",
+            params={"experiment_name": "suggestion_weights"},
+            headers=auth_headers,
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert "variant" in data
+        assert "weights" in data
+        assert "ab_test_enabled" in data
+
+    def test_init_ab_test_experiments(self, client, admin_headers):
+        response = client.post(
+            "/api/v1/advanced/ab-test/experiments/init",
+            headers=admin_headers,
+        )
+        assert response.status_code == 200
+        assert "initialized" in response.json()
+
+    def test_list_ab_test_experiments(self, client, admin_headers):
+        response = client.get(
+            "/api/v1/advanced/ab-test/experiments",
+            headers=admin_headers,
+        )
+        assert response.status_code == 200
+        assert isinstance(response.json(), list)
+
+
+class TestCancellationSnapshot:
+    def test_create_cancellation_snapshot(self, client, test_user_id, test_room_id, admin_headers, db_session):
+        future_start = datetime.now() + timedelta(hours=2)
+        future_end = future_start + timedelta(hours=1)
+
+        booking = Booking(
+            room_id=test_room_id,
+            user_id=test_user_id,
+            title="快照测试会议",
+            start_time=future_start,
+            end_time=future_end,
+            status=BookingStatus.CONFIRMED,
+            attendee_count=5,
+        )
+        db_session.add(booking)
+        db_session.commit()
+        booking_id = booking.id
+
+        response = client.post(
+            f"/api/v1/advanced/cancellation-snapshots/{booking_id}",
+            params={"snapshot_type": "test"},
+            headers=admin_headers,
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert "booking_snapshot" in data
+        assert data["booking_snapshot"]["title"] == "快照测试会议"
+
+    def test_cleanup_expired_snapshots(self, client, test_user_id, test_room_id, admin_headers, db_session):
+        from app.models.models import CancellationAuditSnapshot
+        from datetime import datetime as dt
+
+        future_start = datetime.now() + timedelta(hours=2)
+        future_end = future_start + timedelta(hours=1)
+
+        booking = Booking(
+            room_id=test_room_id,
+            user_id=test_user_id,
+            title="快照清理测试",
+            start_time=future_start,
+            end_time=future_end,
+            status=BookingStatus.CONFIRMED,
+        )
+        db_session.add(booking)
+        db_session.flush()
+        booking_id = booking.id
+
+        old_snapshot = CancellationAuditSnapshot(
+            snapshot_date=dt.utcnow() - timedelta(days=400),
+            booking_id=booking_id,
+            booking_snapshot={"title": "old"},
+            snapshot_type="cancellation",
+        )
+        old_snapshot.created_at = dt.utcnow() - timedelta(days=400)
+        db_session.add(old_snapshot)
+        db_session.commit()
+
+        response = client.post(
+            "/api/v1/advanced/cancellation-snapshots/cleanup",
+            params={"retention_days": 365},
+            headers=admin_headers,
+        )
+        assert response.status_code == 200
+        assert response.json()["deleted_count"] >= 1
+
+
+class TestCoverageModuleTargets:
+    def test_module_coverage_targets(self):
+        from app.services.advanced_service import parse_module_coverage_targets
+
+        targets = parse_module_coverage_targets()
+        assert isinstance(targets, dict)
+        assert len(targets) > 0
+        for module, target in targets.items():
+            assert isinstance(target, float)
+            assert target > 0
+            assert target <= 100
+
+    def test_coverage_sla_init(self, client, admin_headers):
+        response = client.post(
+            "/api/v1/advanced/coverage-sla/init",
+            headers=admin_headers,
+        )
+        assert response.status_code == 200
+        assert "initialized" in response.json()
+
+    def test_coverage_sla_configs(self, client, admin_headers):
+        response = client.get(
+            "/api/v1/advanced/coverage-sla/configs",
+            headers=admin_headers,
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert "configs" in data
+        assert "configured_targets" in data
+        assert "global_target" in data

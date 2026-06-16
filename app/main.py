@@ -3,12 +3,12 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.database import init_db
-from app.routers import auth, rooms, bookings, calendar, batch, delegations, cancellations
+from app.routers import auth, rooms, bookings, calendar, batch, delegations, cancellations, advanced
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
     description="会议室预订系统 API",
-    version="2.0.0",
+    version="2.1.0",
 )
 
 app.add_middleware(
@@ -29,7 +29,7 @@ def startup_event():
 async def root():
     return {
         "message": "会议室预订系统 API",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "docs": "/docs",
         "api_prefix": settings.API_V1_STR,
         "features": [
@@ -44,13 +44,22 @@ async def root():
             "委托代订",
             "时区支持",
             "评分推荐算法",
+            "循环预订跳过策略",
+            "设备过滤与权重调参",
+            "DST 夏令时处理与通知",
+            "委托撤销与审计",
+            "A/B 测试框架",
+            "租户级配置",
+            "校准样本管理",
+            "取消快照留存",
+            "模块覆盖率 SLA",
         ],
     }
 
 
 @app.get("/health", tags=["健康检查"])
 async def health_check():
-    return {"status": "healthy", "version": "2.0.0"}
+    return {"status": "healthy", "version": "2.1.0"}
 
 
 app.include_router(auth.router, prefix=settings.API_V1_STR)
@@ -60,6 +69,7 @@ app.include_router(calendar.router, prefix=settings.API_V1_STR)
 app.include_router(batch.router, prefix=settings.API_V1_STR)
 app.include_router(delegations.router, prefix=settings.API_V1_STR)
 app.include_router(cancellations.router, prefix=settings.API_V1_STR)
+app.include_router(advanced.router, prefix=settings.API_V1_STR)
 
 
 if __name__ == "__main__":
