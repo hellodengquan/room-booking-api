@@ -27,18 +27,72 @@ from app.config import settings
 router = APIRouter(prefix="/calendar", tags=["日历视图"])
 
 
-def _convert_timezone(dt: datetime, from_tz: str, to_tz: str) -> datetime:
+def _convert_timezone(
+    dt: datetime, from_tz: str, to_tz: str, is_dst: Optional[bool] = None
+) -> datetime:
     try:
         import pytz
         from_zone = pytz.timezone(from_tz)
         to_zone = pytz.timezone(to_tz)
+
         if dt.tzinfo is None:
-            dt = from_zone.localize(dt)
-        return dt.astimezone(to_zone).replace(tzinfo=None)
+            try:
+                dt = from_zone.localize(dt, is_dst=is_dst)
+            except pytz.exceptions.AmbiguousTimeError:
+                if is_dst is None and settings.ENABLE_DST_HANDLING:
+                    dt_std = from_zone.localize(dt, is_dst=False)
+                    dt_dst = from_zone.localize(dt, is_dst=True)
+                    dt = dt_std
+                else:
+                    raise
+            except pytz.exceptions.NonExistentTimeError:
+                if settings.ENABLE_DST_HANDLING:
+                    dst_delta = from_zone.dst(dt.replace(tzinfo=None))
+                    if dst_delta and dst_delta.total_seconds() > 0:
+                        dt = from_zone.localize(
+                            dt + timedelta(seconds=int(dst_delta.total_seconds())),
+                            is_dst=True,
+                        )
+                    else:
+                        raise
+                else:
+                    raise
+
+        converted = dt.astimezone(to_zone)
+        return converted.replace(tzinfo=None)
     except ImportError:
         return dt
     except Exception:
         return dt
+
+
+def _is_dst_transition_day(date: datetime, tz_name: str) -> Dict[str, bool]:
+    result = {"is_dst_transition": False, "transition_type": None}
+    try:
+        import pytz
+        tz = pytz.timezone(tz_name)
+        start_of_day = date.replace(hour=0, minute=0, second=0, microsecond=0)
+        end_of_day = date.replace(hour=23, minute=59, second=59, microsecond=999999)
+
+        if start_of_day.tzinfo is None:
+            start_localized = tz.localize(start_of_day, is_dst=None)
+            end_localized = tz.localize(end_of_day, is_dst=None)
+        else:
+            start_localized = start_of_day.astimezone(tz)
+            end_localized = end_of_day.astimezone(tz)
+
+        dst_start = start_localized.dst()
+        dst_end = end_localized.dst()
+
+        if dst_start != dst_end:
+            result["is_dst_transition"] = True
+            if dst_end > dst_start:
+                result["transition_type"] = "spring_forward"
+            else:
+                result["transition_type"] = "fall_back"
+    except Exception:
+        pass
+    return result
 
 
 @router.get("/view", response_model=CalendarViewResponse)

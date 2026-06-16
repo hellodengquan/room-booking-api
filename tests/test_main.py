@@ -1248,3 +1248,276 @@ class TestCoverage:
         response = client.get("/health")
         assert response.status_code == 200
         assert response.json()["version"] == "2.0.0"
+
+
+class TestSuggestionConfig:
+    def test_get_suggestion_config(self, client, auth_headers):
+        response = client.get(
+            "/api/v1/bookings/suggestion-config",
+            headers=auth_headers,
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert "weights" in data
+        assert "thresholds" in data
+        assert "time" in data["weights"]
+        assert "room" in data["weights"]
+        assert "device" in data["weights"]
+        assert "excellent" in data["thresholds"]
+        assert "good" in data["thresholds"]
+        assert "fair" in data["thresholds"]
+
+    def test_score_levels_use_config(self, client, test_room_id, test_room_b_id, auth_headers, db_session):
+        from app.config import settings
+
+        future_start = datetime.now() + timedelta(hours=2)
+        future_end = future_start + timedelta(hours=1)
+
+        existing = Booking(
+            room_id=test_room_id,
+            user_id=1,
+            title="冲突会议",
+            start_time=future_start,
+            end_time=future_end,
+            status=BookingStatus.CONFIRMED,
+        )
+        db_session.add(existing)
+        db_session.commit()
+
+        response = client.get(
+            "/api/v1/bookings/check-conflict",
+            params={
+                "room_id": test_room_id,
+                "start_time": future_start.isoformat(),
+                "end_time": future_end.isoformat(),
+                "attendee_count": 5,
+            },
+            headers=auth_headers,
+        )
+        assert response.status_code == 200
+        alternatives = response.json()["alternatives"]
+        assert len(alternatives) > 0
+
+        for alt in alternatives:
+            score = alt["score"]
+            level = alt["score_level"]
+            if score >= settings.SUGGESTION_SCORE_LEVEL_EXCELLENT:
+                assert level == "excellent"
+            elif score >= settings.SUGGESTION_SCORE_LEVEL_GOOD:
+                assert level == "good"
+            elif score >= settings.SUGGESTION_SCORE_LEVEL_FAIR:
+                assert level == "fair"
+            else:
+                assert level == "poor"
+
+
+class TestDelegationRevoke:
+    def test_revoke_delegation(self, client, test_user_id, test_room_id, auth_headers, db_session):
+        from app.models.models import User, BookingDelegation
+
+        delegate_user = User(
+            username="revoketestuser",
+            email="revoke@example.com",
+            full_name="Revoke Test User",
+            hashed_password=get_password_hash("revoke123"),
+            permission_level=PermissionLevel.BOOK,
+        )
+        db_session.add(delegate_user)
+        db_session.flush()
+        delegate_id = delegate_user.id
+
+        delegation = BookingDelegation(
+            delegator_id=test_user_id,
+            delegate_id=delegate_id,
+            room_id=test_room_id,
+            is_active=True,
+        )
+        db_session.add(delegation)
+        db_session.commit()
+        delegation_id = delegation.id
+
+        response = client.post(
+            f"/api/v1/delegations/{delegation_id}/revoke",
+            json={"reason": "不需要代订了"},
+            headers=auth_headers,
+        )
+        assert response.status_code == 200
+        assert response.json()["is_active"] is False
+        assert response.json()["revoked_at"] is not None
+        assert response.json()["revoked_by"] == test_user_id
+        assert response.json()["revocation_reason"] == "不需要代订了"
+
+    def test_revoke_inactive_delegation_fails(self, client, test_user_id, test_room_id, auth_headers, db_session):
+        from app.models.models import User, BookingDelegation
+
+        delegate_user = User(
+            username="revokefailuser",
+            email="revokefail@example.com",
+            full_name="Revoke Fail User",
+            hashed_password=get_password_hash("revoke123"),
+            permission_level=PermissionLevel.BOOK,
+        )
+        db_session.add(delegate_user)
+        db_session.flush()
+        delegate_id = delegate_user.id
+
+        delegation = BookingDelegation(
+            delegator_id=test_user_id,
+            delegate_id=delegate_id,
+            room_id=test_room_id,
+            is_active=False,
+        )
+        db_session.add(delegation)
+        db_session.commit()
+        delegation_id = delegation.id
+
+        response = client.post(
+            f"/api/v1/delegations/{delegation_id}/revoke",
+            json={},
+            headers=auth_headers,
+        )
+        assert response.status_code == 400
+
+
+class TestCancellationTimeout:
+    def test_process_timeout_requests_reject(
+        self, client, test_user_id, test_room_id, admin_headers, db_session
+    ):
+        from app.models.models import CancellationRequest, CancellationRequestStatus
+
+        future_start = datetime.now() + timedelta(hours=2)
+        future_end = future_start + timedelta(hours=1)
+
+        booking = Booking(
+            room_id=test_room_id,
+            user_id=test_user_id,
+            title="超时测试会议",
+            start_time=future_start,
+            end_time=future_end,
+            status=BookingStatus.CONFIRMED,
+        )
+        db_session.add(booking)
+        db_session.flush()
+        booking_id = booking.id
+
+        old_created = datetime.utcnow() - timedelta(hours=72)
+        request = CancellationRequest(
+            requester_id=test_user_id,
+            booking_ids=[booking_id],
+            status=CancellationRequestStatus.PENDING,
+            cancellation_type="ids",
+        )
+        request.created_at = old_created
+        db_session.add(request)
+        db_session.commit()
+        request_id = request.id
+
+        response = client.post(
+            "/api/v1/cancellations/process-timeouts",
+            params={"timeout_hours": 48, "action": "reject"},
+            headers=admin_headers,
+        )
+        assert response.status_code == 200
+        assert response.json()["processed"] >= 1
+        assert response.json()["rejected"] >= 1
+
+        db_session.expire_all()
+        updated = db_session.query(CancellationRequest).filter(CancellationRequest.id == request_id).first()
+        assert updated.status == CancellationRequestStatus.REJECTED
+
+
+class TestAuditLogCleanup:
+    def test_cleanup_expired_audit_logs(
+        self, client, test_user_id, test_room_id, admin_headers, db_session
+    ):
+        from app.models.models import (
+            CancellationRequest,
+            CancellationRequestStatus,
+            CancellationAuditLog,
+        )
+
+        future_start = datetime.now() + timedelta(hours=2)
+        future_end = future_start + timedelta(hours=1)
+
+        booking = Booking(
+            room_id=test_room_id,
+            user_id=test_user_id,
+            title="清理测试会议",
+            start_time=future_start,
+            end_time=future_end,
+            status=BookingStatus.CANCELLED,
+        )
+        db_session.add(booking)
+        db_session.flush()
+        booking_id = booking.id
+
+        request = CancellationRequest(
+            requester_id=test_user_id,
+            booking_ids=[booking_id],
+            status=CancellationRequestStatus.APPROVED,
+            cancellation_type="ids",
+        )
+        db_session.add(request)
+        db_session.flush()
+        request_id = request.id
+
+        old_log = CancellationAuditLog(
+            request_id=request_id,
+            booking_id=booking_id,
+            original_status=BookingStatus.CONFIRMED,
+            new_status=BookingStatus.CANCELLED,
+            action_type="cancellation",
+        )
+        old_log.created_at = datetime.utcnow() - timedelta(days=100)
+        db_session.add(old_log)
+
+        new_log = CancellationAuditLog(
+            request_id=request_id,
+            booking_id=booking_id,
+            original_status=BookingStatus.CONFIRMED,
+            new_status=BookingStatus.CANCELLED,
+            action_type="cancellation",
+        )
+        db_session.add(new_log)
+        db_session.commit()
+
+        response = client.post(
+            "/api/v1/cancellations/cleanup-audit-logs",
+            params={"retention_days": 90},
+            headers=admin_headers,
+        )
+        assert response.status_code == 200
+        assert response.json()["deleted_count"] >= 1
+
+
+class TestDSTHandling:
+    def test_dst_transition_detection(self):
+        from app.routers.calendar import _is_dst_transition_day
+        from datetime import datetime as dt
+
+        test_date_nyc_spring = dt(2024, 3, 10)
+        result_spring = _is_dst_transition_day(test_date_nyc_spring, "America/New_York")
+        assert isinstance(result_spring, dict)
+        assert "is_dst_transition" in result_spring
+
+        test_date_nyc_fall = dt(2024, 11, 3)
+        result_fall = _is_dst_transition_day(test_date_nyc_fall, "America/New_York")
+        assert isinstance(result_fall, dict)
+
+
+class TestCoverageSLA:
+    def test_coverage_sla_config_exists(self):
+        from app.config import settings
+
+        assert hasattr(settings, "COVERAGE_SLA_TARGET")
+        assert settings.COVERAGE_SLA_TARGET > 0
+        assert settings.COVERAGE_SLA_TARGET <= 100
+
+    def test_pytest_ini_exists(self):
+        import os
+
+        ini_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "pytest.ini",
+        )
+        assert os.path.exists(ini_path)

@@ -264,12 +264,18 @@ def _calculate_suggestion_score(
             if rd.is_permanent
         ]
         available_count = sum(1 for d in required_device_ids if d in room_device_ids)
-        if available_count == len(required_device_ids):
+        total_devices = len(required_device_ids)
+        if available_count == total_devices:
             device_score = 1.0
             reasons.append("所有设备可用")
         elif available_count > 0:
-            device_score = 0.5 * (available_count / len(required_device_ids))
-            reasons.append(f"部分设备可用 ({available_count}/{len(required_device_ids)})")
+            base_device_score = available_count / total_devices
+            device_bonus = min(
+                available_count * settings.DEVICE_MATCH_WEIGHT_PER_DEVICE,
+                0.3,
+            )
+            device_score = min(1.0, base_device_score * 0.5 + device_bonus)
+            reasons.append(f"部分设备可用 ({available_count}/{total_devices})")
             has_devices = False
         else:
             device_score = 0.1
@@ -290,11 +296,11 @@ def _calculate_suggestion_score(
 
 
 def _determine_score_level(score: float) -> SuggestionScoreLevel:
-    if score >= 0.85:
+    if score >= settings.SUGGESTION_SCORE_LEVEL_EXCELLENT:
         return SuggestionScoreLevel.EXCELLENT
-    elif score >= 0.7:
+    elif score >= settings.SUGGESTION_SCORE_LEVEL_GOOD:
         return SuggestionScoreLevel.GOOD
-    elif score >= 0.5:
+    elif score >= settings.SUGGESTION_SCORE_LEVEL_FAIR:
         return SuggestionScoreLevel.FAIR
     else:
         return SuggestionScoreLevel.POOR
@@ -979,3 +985,90 @@ def get_available_slots_with_devices(
             )
 
     return slots
+
+
+def cleanup_expired_audit_logs(db: Session, retention_days: int = None) -> int:
+    if retention_days is None:
+        retention_days = settings.CANCELLATION_AUDIT_RETENTION_DAYS
+
+    cutoff_date = datetime.utcnow() - timedelta(days=retention_days)
+
+    expired_logs = (
+        db.query(CancellationAuditLog)
+        .filter(CancellationAuditLog.created_at < cutoff_date)
+        .all()
+    )
+
+    count = len(expired_logs)
+    for log in expired_logs:
+        db.delete(log)
+
+    db.commit()
+    return count
+
+
+def process_timeout_cancellation_requests(
+    db: Session,
+    timeout_hours: int = None,
+    action: str = None,
+) -> Dict[str, int]:
+    if timeout_hours is None:
+        timeout_hours = settings.CANCELLATION_APPROVAL_TIMEOUT_HOURS
+    if action is None:
+        action = settings.CANCELLATION_APPROVAL_TIMEOUT_ACTION
+
+    timeout_cutoff = datetime.utcnow() - timedelta(hours=timeout_hours)
+
+    pending_requests = (
+        db.query(CancellationRequest)
+        .filter(CancellationRequest.status == CancellationRequestStatus.PENDING)
+        .filter(CancellationRequest.created_at < timeout_cutoff)
+        .all()
+    )
+
+    result = {"processed": 0, "rejected": 0, "approved": 0}
+
+    for request in pending_requests:
+        if action == "reject":
+            request.status = CancellationRequestStatus.REJECTED
+            result["rejected"] += 1
+        elif action == "approve":
+            request.status = CancellationRequestStatus.APPROVED
+            result["approved"] += 1
+            for booking_id in request.booking_ids:
+                booking = db.query(Booking).filter(Booking.id == booking_id).first()
+                if booking and booking.status == BookingStatus.CONFIRMED:
+                    audit_log = CancellationAuditLog(
+                        request_id=request.id,
+                        booking_id=booking_id,
+                        original_status=booking.status,
+                        new_status=BookingStatus.CANCELLED,
+                        action_type="timeout_approval",
+                        action_by=None,
+                    )
+                    db.add(audit_log)
+                    booking.status = BookingStatus.CANCELLED
+
+        request.approval_reason = f"自动{action}（超时{timeout_hours}小时）"
+        result["processed"] += 1
+
+    db.commit()
+    return result
+
+
+def get_score_thresholds() -> Dict[str, float]:
+    return {
+        "excellent": settings.SUGGESTION_SCORE_LEVEL_EXCELLENT,
+        "good": settings.SUGGESTION_SCORE_LEVEL_GOOD,
+        "fair": settings.SUGGESTION_SCORE_LEVEL_FAIR,
+        "poor": 0.0,
+    }
+
+
+def get_suggestion_weights() -> Dict[str, float]:
+    return {
+        "time": settings.SUGGESTION_SCORE_WEIGHT_TIME,
+        "room": settings.SUGGESTION_SCORE_WEIGHT_ROOM,
+        "device": settings.SUGGESTION_SCORE_WEIGHT_DEVICE,
+        "device_per_match": settings.DEVICE_MATCH_WEIGHT_PER_DEVICE,
+    }

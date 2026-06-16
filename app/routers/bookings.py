@@ -33,6 +33,8 @@ from app.services.booking_service import (
     create_recurring_bookings,
     skip_booking,
     check_delegation_permission,
+    get_score_thresholds,
+    get_suggestion_weights,
 )
 
 router = APIRouter(prefix="/bookings", tags=["预订管理"])
@@ -122,6 +124,16 @@ async def check_conflict(
         "time_conflicts": time_conflicts,
         "device_conflicts": device_conflicts,
         "alternatives": alternatives,
+    }
+
+
+@router.get("/suggestion-config")
+async def get_suggestion_config(
+    current_user: User = Depends(get_current_active_user),
+):
+    return {
+        "weights": get_suggestion_weights(),
+        "thresholds": get_score_thresholds(),
     }
 
 

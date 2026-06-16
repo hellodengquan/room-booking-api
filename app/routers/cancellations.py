@@ -16,6 +16,8 @@ from app.services.booking_service import (
     create_cancellation_request,
     approve_cancellation,
     rollback_cancellation,
+    process_timeout_cancellation_requests,
+    cleanup_expired_audit_logs,
 )
 
 router = APIRouter(prefix="/cancellations", tags=["取消审批"])
@@ -155,3 +157,32 @@ async def get_cancellation_audit_logs(
         raise HTTPException(status_code=404, detail="取消申请不存在")
 
     return request.audit_logs
+
+
+@router.post("/process-timeouts")
+async def process_timeout_requests(
+    timeout_hours: int = None,
+    action: str = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin_permission),
+):
+    result = process_timeout_cancellation_requests(db, timeout_hours, action)
+    return {
+        "success": True,
+        "processed": result["processed"],
+        "rejected": result["rejected"],
+        "approved": result["approved"],
+    }
+
+
+@router.post("/cleanup-audit-logs")
+async def cleanup_audit_logs_endpoint(
+    retention_days: int = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin_permission),
+):
+    deleted_count = cleanup_expired_audit_logs(db, retention_days)
+    return {
+        "success": True,
+        "deleted_count": deleted_count,
+    }

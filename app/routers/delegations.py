@@ -9,6 +9,7 @@ from app.schemas.schemas import (
     BookingDelegationCreate,
     BookingDelegationUpdate,
     BookingDelegationResponse,
+    DelegationRevokeRequest,
 )
 from app.services.booking_service import (
     create_delegation,
@@ -142,3 +143,42 @@ async def deactivate_delegation(
     delegation.is_active = False
     db.commit()
     return None
+
+
+@router.post("/{delegation_id}/revoke", response_model=BookingDelegationResponse)
+async def revoke_delegation(
+    delegation_id: int,
+    revoke_in: DelegationRevokeRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    delegation = (
+        db.query(BookingDelegation)
+        .filter(BookingDelegation.id == delegation_id)
+        .first()
+    )
+    if not delegation:
+        raise HTTPException(status_code=404, detail="委托不存在")
+
+    if delegation.delegator_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="只有委托人才能撤销委托",
+        )
+
+    if not delegation.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="委托已处于非激活状态",
+        )
+
+    from datetime import datetime as dt
+
+    delegation.is_active = False
+    delegation.revoked_at = dt.utcnow()
+    delegation.revoked_by = current_user.id
+    delegation.revocation_reason = revoke_in.reason
+
+    db.commit()
+    db.refresh(delegation)
+    return delegation

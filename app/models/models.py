@@ -245,6 +245,9 @@ class BookingDelegation(Base):
     end_date = Column(DateTime)
     reason = Column(Text)
     created_at = Column(DateTime, default=datetime.utcnow)
+    revoked_at = Column(DateTime)
+    revoked_by = Column(Integer, ForeignKey("users.id"))
+    revocation_reason = Column(Text)
 
     delegator = relationship(
         "User", foreign_keys=[delegator_id], back_populates="delegations_from"

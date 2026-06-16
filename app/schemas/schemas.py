@@ -419,6 +419,13 @@ class BookingDelegationResponse(BaseModel):
     end_date: Optional[datetime]
     reason: Optional[str]
     created_at: datetime
+    revoked_at: Optional[datetime] = None
+    revoked_by: Optional[int] = None
+    revocation_reason: Optional[str] = None
+
+
+class DelegationRevokeRequest(BaseModel):
+    reason: Optional[str] = None
 
 
 class RollbackRequest(BaseModel):
